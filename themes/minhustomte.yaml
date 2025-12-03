@@ -1,0 +1,86 @@
+# MinHustomte Portal Theme
+# Forest/Nature inspired color scheme matching the web portal
+
+minhustomte:
+  # Primary colors - Forest Green
+  primary-color: "#1A663D"
+  accent-color: "#3D8F6E"
+  
+  # Background colors
+  primary-background-color: "#F9F7F3"
+  secondary-background-color: "#FFFFFF"
+  card-background-color: "#FFFFFF"
+  
+  # Text colors
+  primary-text-color: "#1A3D2B"
+  secondary-text-color: "#5A7A6A"
+  text-primary-color: "#1A3D2B"
+  disabled-text-color: "#8A9A92"
+  
+  # Header/Sidebar
+  app-header-background-color: "#1A663D"
+  app-header-text-color: "#FFFFFF"
+  sidebar-background-color: "#FAFAF8"
+  sidebar-text-color: "#1A3D2B"
+  sidebar-selected-background-color: "#E8F0EC"
+  sidebar-selected-icon-color: "#1A663D"
+  
+  # Cards and elements
+  ha-card-background: "#FFFFFF"
+  ha-card-border-radius: "12px"
+  ha-card-box-shadow: "0 4px 20px -8px rgba(26, 102, 61, 0.15)"
+  
+  # State colors
+  state-icon-color: "#3D8F6E"
+  state-icon-active-color: "#1A663D"
+  state-on-color: "#1A663D"
+  state-off-color: "#8A9A92"
+  
+  # Buttons
+  mdc-button-outline-color: "#1A663D"
+  
+  # Switches and toggles
+  switch-checked-button-color: "#1A663D"
+  switch-checked-track-color: "#3D8F6E"
+  switch-unchecked-button-color: "#E0E0E0"
+  switch-unchecked-track-color: "#BDBDBD"
+  
+  # Sliders
+  paper-slider-knob-color: "#1A663D"
+  paper-slider-active-color: "#1A663D"
+  paper-slider-container-color: "#E8F0EC"
+  
+  # Dividers and borders
+  divider-color: "rgba(26, 102, 61, 0.12)"
+  
+  # Labels
+  label-badge-background-color: "#1A663D"
+  label-badge-text-color: "#FFFFFF"
+  
+  # Chips
+  chip-background-color: "#E8F0EC"
+  chip-text-color: "#1A3D2B"
+
+minhustomte_dark:
+  # Dark mode variant
+  primary-color: "#3D8F6E"
+  accent-color: "#5AAF8E"
+  
+  primary-background-color: "#0D1F17"
+  secondary-background-color: "#152A20"
+  card-background-color: "#1A3D2B"
+  
+  primary-text-color: "#E8F0EC"
+  secondary-text-color: "#A0B8AC"
+  text-primary-color: "#E8F0EC"
+  
+  app-header-background-color: "#152A20"
+  app-header-text-color: "#E8F0EC"
+  sidebar-background-color: "#0D1F17"
+  sidebar-text-color: "#E8F0EC"
+  
+  ha-card-background: "#1A3D2B"
+  ha-card-box-shadow: "0 4px 20px -8px rgba(0, 0, 0, 0.4)"
+  
+  state-icon-color: "#5AAF8E"
+  state-icon-active-color: "#3D8F6E"

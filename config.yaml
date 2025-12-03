@@ -1,0 +1,40 @@
+name: "MinHustomte Portal Integration"
+version: "1.0.0"
+slug: "minhustomte_portal"
+description: "Ansluter din HomeAssistant till MinHustomte portalen. Ange din auth-kod från portalen i konfigurationen."
+url: "https://portal.minhustomte.se"
+
+arch:
+  - armhf
+  - armv7
+  - aarch64
+  - amd64
+  - i386
+
+startup: application
+boot: auto
+
+options:
+  auth_code: ""
+  api_endpoint: "https://qqmxykhzatbdsabsarrd.supabase.co"
+  backup_enabled: true
+  backup_schedule: "0 3 * * *"
+
+schema:
+  auth_code: "str?"
+  api_endpoint: "url"
+  backup_enabled: "bool"
+  backup_schedule: "str"
+
+ports: {}
+
+environment: {}
+
+host_network: true
+
+privileged:
+  - SYS_ADMIN
+
+homeassistant_api: true
+hassio_api: true
+hassio_role: admin
