@@ -20,18 +20,34 @@ class MinHustomteIntegration:
     # ... (behåll load_config, authenticate, create_ha_user, install_theme, backup_config som de är) ...
 
     def get_cameras_from_ha(self):
-        """Fetch all cameras from HomeAssistant"""
+    token = os.environ.get('HASSIO_TOKEN')
+    if not token:
+        logger.error("HASSIO_TOKEN not found in environment")
+        return []
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json',
+    }
+
+    # Försök flera kända vägar (en av dem fungerar nästan alltid)
+    urls = [
+        "http://supervisor/core/api/states",
+        "http://homeassistant:8123/api/states",
+        "http://homeassistant/local/api/states",
+    ]
+
+    for url in urls:
         try:
-            supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
-            
-            response = requests.get(
-                'http://supervisor/core/api/states',
-                headers={'Authorization': f'Bearer {supervisor_token}'}
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Failed to get HA states: {response.status_code}")
-                return []
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                # Success!
+                break
+        except:
+            continue
+    else:
+        logger.error("All attempts to reach Home Assistant API failed")
+        return []
             
             cameras = []
             for entity in response.json():
