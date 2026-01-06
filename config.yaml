@@ -1,5 +1,5 @@
 name: "MinHustomte Portal Integration"
-version: "1.0.0"
+version: "1.0.1"
 slug: "minhustomte_portal"
 description: "Ansluter din HomeAssistant till MinHustomte portalen. Ange din auth-kod från portalen i konfigurationen."
 url: "https://portal.minhustomte.se"
