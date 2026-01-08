@@ -11,8 +11,18 @@ import time
 import logging
 import requests
 import hashlib
+import threading
+import base64
 from datetime import datetime
 from pathlib import Path
+
+# WebSocket support
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    logging.warning("websocket-client not installed, camera streaming disabled")
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +30,146 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class CameraStreamer:
+    """Handles WebSocket streaming of camera frames to portal."""
+    
+    def __init__(self, integration, entity_id):
+        self.integration = integration
+        self.entity_id = entity_id
+        self.ws = None
+        self.running = False
+        self.thread = None
+        self.frame_interval = 0.1  # 10 FPS
+    
+    def start(self):
+        """Start streaming camera frames."""
+        if not WEBSOCKET_AVAILABLE:
+            logger.error("WebSocket not available, cannot stream camera")
+            return False
+        
+        self.running = True
+        self.thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self.thread.start()
+        logger.info(f"Started camera streamer for {self.entity_id}")
+        return True
+    
+    def stop(self):
+        """Stop streaming."""
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+        self.ws = None
+        logger.info(f"Stopped camera streamer for {self.entity_id}")
+    
+    def _connect(self):
+        """Connect to portal WebSocket."""
+        try:
+            ws_url = (
+                f"wss://qqmxykhzatbdsabsarrd.supabase.co/functions/v1/camera-stream"
+                f"?role=provider"
+                f"&cabin_id={self.integration.cabin_id}"
+                f"&entity_id={self.entity_id}"
+                f"&ha_username={self.integration.ha_username}"
+                f"&ha_password={self.integration.ha_password}"
+            )
+            
+            logger.info(f"Connecting to stream relay: {ws_url[:80]}...")
+            
+            self.ws = websocket.create_connection(
+                ws_url,
+                timeout=30,
+                header=["User-Agent: MinHustomte-HA-Addon/1.0"]
+            )
+            
+            logger.info(f"Connected to stream relay for {self.entity_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to connect to stream relay: {e}")
+            return False
+    
+    def _get_camera_frame(self):
+        """Get current camera frame from Home Assistant."""
+        try:
+            response = requests.get(
+                f"{self.integration.get_ha_api_url()}/camera_proxy/{self.entity_id}",
+                headers=self.integration.get_ha_headers(),
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.warning(f"Failed to get camera frame: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting camera frame: {e}")
+            return None
+    
+    def _stream_loop(self):
+        """Main streaming loop."""
+        reconnect_delay = 5
+        
+        while self.running:
+            try:
+                if not self.ws or not self.ws.connected:
+                    if not self._connect():
+                        time.sleep(reconnect_delay)
+                        continue
+                
+                try:
+                    msg = self.ws.recv()
+                    data = json.loads(msg)
+                    
+                    if data.get('type') == 'start_stream':
+                        logger.info(f"Received start_stream command for {self.entity_id}")
+                        self._send_frames()
+                    
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error receiving message: {e}")
+                    self.ws = None
+                    time.sleep(reconnect_delay)
+                    
+            except Exception as e:
+                logger.error(f"Stream loop error: {e}")
+                time.sleep(reconnect_delay)
+        
+        logger.info(f"Stream loop ended for {self.entity_id}")
+    
+    def _send_frames(self):
+        """Send camera frames to connected viewers."""
+        frames_sent = 0
+        
+        while self.running and self.ws and self.ws.connected:
+            try:
+                frame_data = self._get_camera_frame()
+                
+                if frame_data:
+                    self.ws.send_binary(frame_data)
+                    frames_sent += 1
+                    
+                    if frames_sent % 100 == 0:
+                        logger.debug(f"Sent {frames_sent} frames for {self.entity_id}")
+                
+                time.sleep(self.frame_interval)
+                
+            except websocket.WebSocketConnectionClosedException:
+                logger.info(f"WebSocket closed, stopping frame sending")
+                break
+            except Exception as e:
+                logger.error(f"Error sending frame: {e}")
+                break
+        
+        logger.info(f"Frame sending ended, total frames: {frames_sent}")
+
 
 class MinHustomteIntegration:
     def __init__(self):
@@ -30,6 +180,7 @@ class MinHustomteIntegration:
         self.ha_password = None
         self.api_endpoint = None
         self.credentials_file = '/data/minhustomte_credentials.json'
+        self.camera_streamers = {}
         self.load_config()
     
     def load_config(self):
@@ -136,8 +287,6 @@ class MinHustomteIntegration:
             return False
         
         try:
-            # This would create a user in Home Assistant
-            # For now, just log the intention
             logger.info(f"Would create HA user: {self.ha_username}")
             return True
         except Exception as e:
@@ -184,7 +333,6 @@ minhustomte:
             
             logger.info("Theme installed successfully")
             
-            # Reload themes
             try:
                 requests.post(
                     f"{self.get_ha_api_url()}/services/frontend/reload_themes",
@@ -207,13 +355,11 @@ minhustomte:
             return False
         
         try:
-            # Collect configuration data
             config_data = {
                 'timestamp': datetime.now().isoformat(),
                 'version': '1.0'
             }
             
-            # Get automations
             try:
                 automations_file = Path('/config/automations.yaml')
                 if automations_file.exists():
@@ -222,7 +368,6 @@ minhustomte:
             except Exception as e:
                 logger.warning(f"Could not read automations: {e}")
             
-            # Get scripts
             try:
                 scripts_file = Path('/config/scripts.yaml')
                 if scripts_file.exists():
@@ -231,7 +376,6 @@ minhustomte:
             except Exception as e:
                 logger.warning(f"Could not read scripts: {e}")
             
-            # Get scenes
             try:
                 scenes_file = Path('/config/scenes.yaml')
                 if scenes_file.exists():
@@ -240,7 +384,6 @@ minhustomte:
             except Exception as e:
                 logger.warning(f"Could not read scenes: {e}")
             
-            # Send backup to portal
             response = requests.post(
                 f"{self.api_endpoint}/functions/v1/raspberry-backup",
                 json={
@@ -304,7 +447,6 @@ minhustomte:
                 device_class = attributes.get('device_class', '')
                 state_value = state.get('state', '')
                 
-                # Skip unavailable states
                 if state_value in ['unavailable', 'unknown', '']:
                     continue
                 
@@ -315,13 +457,11 @@ minhustomte:
                 
                 entity_lower = entity_id.lower()
                 
-                # Current power consumption
                 if device_class == 'power' or 'power' in entity_lower:
                     if 'total' not in entity_lower and electricity_data['current_power'] is None:
                         electricity_data['current_power'] = value
                         logger.debug(f"Found current power: {entity_id} = {value}")
                 
-                # Energy consumption
                 if device_class == 'energy' or 'energy' in entity_lower or 'kwh' in entity_lower:
                     if 'today' in entity_lower or 'daily' in entity_lower:
                         electricity_data['today_usage'] = value
@@ -332,7 +472,6 @@ minhustomte:
                     elif 'export' in entity_lower:
                         electricity_data['total_export'] = value
                 
-                # Voltage
                 if device_class == 'voltage' or 'voltage' in entity_lower:
                     if 'l1' in entity_lower or 'phase_1' in entity_lower:
                         electricity_data['phase_l1_voltage'] = value
@@ -343,7 +482,6 @@ minhustomte:
                     elif electricity_data['voltage'] is None:
                         electricity_data['voltage'] = value
                 
-                # Current (amps)
                 if device_class == 'current' or 'current' in entity_lower or 'ampere' in entity_lower:
                     if 'l1' in entity_lower or 'phase_1' in entity_lower:
                         electricity_data['phase_l1_current'] = value
@@ -354,7 +492,6 @@ minhustomte:
                     elif electricity_data['current_amps'] is None:
                         electricity_data['current_amps'] = value
                 
-                # Phase power
                 if 'power' in entity_lower:
                     if 'l1' in entity_lower or 'phase_1' in entity_lower:
                         electricity_data['phase_l1_power'] = value
@@ -363,7 +500,6 @@ minhustomte:
                     elif 'l3' in entity_lower or 'phase_3' in entity_lower:
                         electricity_data['phase_l3_power'] = value
                 
-                # Power factor
                 if 'power_factor' in entity_lower or device_class == 'power_factor':
                     electricity_data['power_factor'] = value
             
@@ -386,7 +522,6 @@ minhustomte:
                 logger.warning("No electricity data found to sync")
                 return False
             
-            # Clean the data - remove None values
             clean_data = {k: v for k, v in electricity_data.items() if v is not None}
             
             logger.info(f"Syncing electricity data: {clean_data}")
@@ -414,12 +549,8 @@ minhustomte:
             logger.error(f"Error syncing electricity: {e}")
             return False
     
-    def sync_cameras(self):
-        """Sync camera entities to portal."""
-        if not self.authenticated:
-            logger.warning("Not authenticated, skipping camera sync")
-            return False
-        
+    def get_cameras(self):
+        """Get all camera entities from Home Assistant."""
         try:
             response = requests.get(
                 f"{self.get_ha_api_url()}/states",
@@ -429,7 +560,7 @@ minhustomte:
             
             if response.status_code != 200:
                 logger.error(f"Failed to get states for cameras: {response.status_code}")
-                return False
+                return []
             
             states = response.json()
             cameras = []
@@ -446,6 +577,21 @@ minhustomte:
                         'model': attributes.get('model'),
                         'supports_stream': attributes.get('supported_features', 0) & 2 > 0
                     })
+            
+            return cameras
+            
+        except Exception as e:
+            logger.error(f"Error getting cameras: {e}")
+            return []
+    
+    def sync_cameras(self):
+        """Sync camera entities to portal."""
+        if not self.authenticated:
+            logger.warning("Not authenticated, skipping camera sync")
+            return False
+        
+        try:
+            cameras = self.get_cameras()
             
             if not cameras:
                 logger.info("No cameras found to sync")
@@ -476,13 +622,35 @@ minhustomte:
             logger.error(f"Error syncing cameras: {e}")
             return False
     
+    def start_camera_streamers(self):
+        """Start streaming for all available cameras."""
+        if not WEBSOCKET_AVAILABLE:
+            logger.warning("WebSocket not available, camera streaming disabled")
+            return
+        
+        cameras = self.get_cameras()
+        
+        for camera in cameras:
+            entity_id = camera['entity_id']
+            
+            if entity_id not in self.camera_streamers:
+                streamer = CameraStreamer(self, entity_id)
+                if streamer.start():
+                    self.camera_streamers[entity_id] = streamer
+                    logger.info(f"Started streamer for {entity_id}")
+    
+    def stop_camera_streamers(self):
+        """Stop all camera streamers."""
+        for entity_id, streamer in self.camera_streamers.items():
+            streamer.stop()
+        self.camera_streamers.clear()
+    
     def run(self):
         """Main run loop."""
         logger.info("Starting MinHustomte Integration")
         
         # Try to load existing credentials
         if not self.load_credentials():
-            # Authenticate with portal
             if not self.authenticate():
                 logger.error("Failed to authenticate with portal")
                 return
@@ -498,10 +666,13 @@ minhustomte:
         self.sync_cameras()
         self.backup_config()
         
+        # Start camera streamers
+        self.start_camera_streamers()
+        
         # Get sync intervals from config
-        electricity_interval = self.config.get('electricity_sync_interval', 60)  # seconds
-        camera_interval = self.config.get('camera_sync_interval', 300)  # seconds
-        backup_interval = self.config.get('backup_interval', 3600)  # seconds
+        electricity_interval = self.config.get('electricity_sync_interval', 60)
+        camera_interval = self.config.get('camera_sync_interval', 300)
+        backup_interval = self.config.get('backup_interval', 3600)
         
         last_electricity_sync = time.time()
         last_camera_sync = time.time()
@@ -514,26 +685,25 @@ minhustomte:
             try:
                 current_time = time.time()
                 
-                # Sync electricity
                 if current_time - last_electricity_sync >= electricity_interval:
                     self.sync_electricity()
                     last_electricity_sync = current_time
                 
-                # Sync cameras
                 if current_time - last_camera_sync >= camera_interval:
                     self.sync_cameras()
+                    # Restart streamers if needed
+                    self.start_camera_streamers()
                     last_camera_sync = current_time
                 
-                # Backup
                 if current_time - last_backup >= backup_interval:
                     self.backup_config()
                     last_backup = current_time
                 
-                # Sleep for a bit
                 time.sleep(10)
                 
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
+                self.stop_camera_streamers()
                 break
             except Exception as e:
                 logger.error(f"Error in main loop: {e}")
