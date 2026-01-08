@@ -70,7 +70,7 @@ class CameraStreamer:
         """Connect to portal WebSocket."""
         try:
             ws_url = (
-                f"wss://qqmxykhzatbdsabsarrd.supabase.co/functions/v1/camera-stream"
+                f"wss://qqmxykhzatbdsabsarrd.functions.supabase.co/functions/v1/camera-stream"
                 f"?role=provider"
                 f"&cabin_id={self.integration.cabin_id}"
                 f"&entity_id={self.entity_id}"
