@@ -13,6 +13,7 @@ import requests
 import hashlib
 import threading
 import base64
+from urllib.parse import quote_plus
 from datetime import datetime
 from pathlib import Path
 
@@ -72,10 +73,10 @@ class CameraStreamer:
             ws_url = (
                 f"wss://qqmxykhzatbdsabsarrd.functions.supabase.co/functions/v1/camera-stream"
                 f"?role=provider"
-                f"&cabin_id={self.integration.cabin_id}"
-                f"&entity_id={self.entity_id}"
-                f"&ha_username={self.integration.ha_username}"
-                f"&ha_password={self.integration.ha_password}"
+                f"&cabin_id={quote_plus(str(self.integration.cabin_id or ''))}"
+                f"&entity_id={quote_plus(str(self.entity_id or ''))}"
+                f"&ha_username={quote_plus(str(self.integration.ha_username or ''))}"
+                f"&ha_password={quote_plus(str(self.integration.ha_password or ''))}"
             )
             
             logger.info(f"Connecting to stream relay: {ws_url[:80]}...")
@@ -96,6 +97,7 @@ class CameraStreamer:
     def _get_camera_frame(self):
         """Get current camera frame from Home Assistant."""
         try:
+            # Use camera.get_image service or direct API
             response = requests.get(
                 f"{self.integration.get_ha_api_url()}/camera_proxy/{self.entity_id}",
                 headers=self.integration.get_ha_headers(),
@@ -118,11 +120,13 @@ class CameraStreamer:
         
         while self.running:
             try:
+                # Connect if not connected
                 if not self.ws or not self.ws.connected:
                     if not self._connect():
                         time.sleep(reconnect_delay)
                         continue
                 
+                # Wait for start_stream command
                 try:
                     msg = self.ws.recv()
                     data = json.loads(msg)
@@ -150,9 +154,11 @@ class CameraStreamer:
         
         while self.running and self.ws and self.ws.connected:
             try:
+                # Get frame from camera
                 frame_data = self._get_camera_frame()
                 
                 if frame_data:
+                    # Send as binary
                     self.ws.send_binary(frame_data)
                     frames_sent += 1
                     
