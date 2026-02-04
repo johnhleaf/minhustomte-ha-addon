@@ -33,6 +33,250 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class TunnelClient:
+    """Handles HA tunnel requests from portal via Supabase Realtime."""
+    
+    def __init__(self, integration):
+        self.integration = integration
+        self.running = False
+        self.thread = None
+        self.poll_interval = 2  # Poll every 2 seconds
+    
+    def start(self):
+        """Start listening for tunnel requests."""
+        self.running = True
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+        logger.info("Started HA tunnel client")
+        return True
+    
+    def stop(self):
+        """Stop listening."""
+        self.running = False
+        logger.info("Stopped HA tunnel client")
+    
+    def _poll_loop(self):
+        """Poll for pending tunnel requests."""
+        while self.running:
+            try:
+                self._process_pending_requests()
+                time.sleep(self.poll_interval)
+            except Exception as e:
+                logger.error(f"Error in tunnel poll loop: {e}")
+                time.sleep(5)
+    
+    def _process_pending_requests(self):
+        """Check for and process pending tunnel requests."""
+        if not self.integration.authenticated:
+            return
+        
+        try:
+            # Fetch pending requests for this cabin
+            response = requests.get(
+                f"{self.integration.api_endpoint}/rest/v1/ha_tunnel_requests",
+                params={
+                    'cabin_id': f'eq.{self.integration.cabin_id}',
+                    'status': 'eq.pending',
+                    'select': '*'
+                },
+                headers={
+                    'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxbXh5a2h6YXRiZHNhYnNhcnJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ1MzAyNTQsImV4cCI6MjA4MDEwNjI1NH0.tXboR_2k7Pwh3cFAngWKNL9f2f-YdZM6sVVD4lFYQKo',
+                    'Authorization': f'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxbXh5a2h6YXRiZHNhYnNhcnJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ1MzAyNTQsImV4cCI6MjA4MDEwNjI1NH0.tXboR_2k7Pwh3cFAngWKNL9f2f-YdZM6sVVD4lFYQKo',
+                    'Content-Type': 'application/json'
+                },
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                return
+            
+            requests_list = response.json()
+            
+            for req in requests_list:
+                self._handle_request(req)
+                
+        except Exception as e:
+            logger.debug(f"Error fetching tunnel requests: {e}")
+    
+    def _handle_request(self, req):
+        """Handle a single tunnel request."""
+        request_id = req.get('id')
+        request_data = req.get('request', {})
+        action = request_data.get('action')
+        
+        logger.info(f"Processing tunnel request: {action} (ID: {request_id})")
+        
+        try:
+            result = None
+            error = None
+            
+            if action == 'ping':
+                result = {'status': 'pong', 'timestamp': datetime.now().isoformat()}
+            
+            elif action == 'list_entities':
+                result = self._list_entities(request_data.get('filter'))
+            
+            elif action == 'get_state':
+                entity_id = request_data.get('entity_id')
+                result = self._get_state(entity_id)
+            
+            elif action == 'get_states':
+                result = self._get_all_states()
+            
+            elif action == 'call_service':
+                domain = request_data.get('domain')
+                service = request_data.get('service')
+                service_data = request_data.get('service_data', {})
+                result = self._call_service(domain, service, service_data)
+            
+            else:
+                error = f"Unknown action: {action}"
+            
+            # Update request with response
+            self._update_request(request_id, result, error)
+            
+        except Exception as e:
+            logger.error(f"Error handling tunnel request: {e}")
+            self._update_request(request_id, None, str(e))
+    
+    def _update_request(self, request_id, result, error):
+        """Update the request with response."""
+        try:
+            update_data = {
+                'status': 'completed' if error is None else 'error',
+                'updated_at': datetime.now().isoformat()
+            }
+            
+            if result is not None:
+                update_data['response'] = result
+            if error is not None:
+                update_data['error'] = error
+            
+            response = requests.patch(
+                f"{self.integration.api_endpoint}/rest/v1/ha_tunnel_requests",
+                params={'id': f'eq.{request_id}'},
+                json=update_data,
+                headers={
+                    'apikey': 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxbXh5a2h6YXRiZHNhYnNhcnJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ1MzAyNTQsImV4cCI6MjA4MDEwNjI1NH0.tXboR_2k7Pwh3cFAngWKNL9f2f-YdZM6sVVD4lFYQKo',
+                    'Authorization': f'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFxbXh5a2h6YXRiZHNhYnNhcnJkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ1MzAyNTQsImV4cCI6MjA4MDEwNjI1NH0.tXboR_2k7Pwh3cFAngWKNL9f2f-YdZM6sVVD4lFYQKo',
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal'
+                },
+                timeout=10
+            )
+            
+            if response.status_code in [200, 204]:
+                logger.info(f"Updated tunnel request {request_id}: {'completed' if error is None else 'error'}")
+            else:
+                logger.error(f"Failed to update request: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Error updating tunnel request: {e}")
+    
+    def _list_entities(self, filter_opts=None):
+        """List all HA entities with optional filtering."""
+        try:
+            ha_url = self.integration.get_ha_api_url()
+            headers = self.integration.get_ha_headers()
+            
+            response = requests.get(
+                f"{ha_url}/states",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                return {'error': f"HA API error: {response.status_code}"}
+            
+            states = response.json()
+            entities = []
+            
+            for state in states:
+                entity = {
+                    'entity_id': state.get('entity_id'),
+                    'state': state.get('state'),
+                    'friendly_name': state.get('attributes', {}).get('friendly_name'),
+                    'device_class': state.get('attributes', {}).get('device_class'),
+                    'unit_of_measurement': state.get('attributes', {}).get('unit_of_measurement'),
+                    'domain': state.get('entity_id', '').split('.')[0]
+                }
+                
+                # Apply filters if provided
+                if filter_opts:
+                    if filter_opts.get('domain') and entity['domain'] != filter_opts['domain']:
+                        continue
+                    if filter_opts.get('device_class') and entity['device_class'] != filter_opts['device_class']:
+                        continue
+                
+                entities.append(entity)
+            
+            return {'entities': entities, 'count': len(entities)}
+            
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _get_state(self, entity_id):
+        """Get state of a specific entity."""
+        try:
+            ha_url = self.integration.get_ha_api_url()
+            headers = self.integration.get_ha_headers()
+            
+            response = requests.get(
+                f"{ha_url}/states/{entity_id}",
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {'error': f"Entity not found: {entity_id}"}
+                
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _get_all_states(self):
+        """Get all states from HA."""
+        try:
+            ha_url = self.integration.get_ha_api_url()
+            headers = self.integration.get_ha_headers()
+            
+            response = requests.get(
+                f"{ha_url}/states",
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return {'states': response.json()}
+            else:
+                return {'error': f"HA API error: {response.status_code}"}
+                
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _call_service(self, domain, service, service_data):
+        """Call a HA service."""
+        try:
+            ha_url = self.integration.get_ha_api_url()
+            headers = self.integration.get_ha_headers()
+            
+            response = requests.post(
+                f"{ha_url}/services/{domain}/{service}",
+                json=service_data,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return {'success': True, 'result': response.json()}
+            else:
+                return {'error': f"Service call failed: {response.status_code}"}
+                
+        except Exception as e:
+            return {'error': str(e)}
+
+
 class CameraStreamer:
     """Handles WebSocket streaming of camera frames to portal."""
     
@@ -78,18 +322,24 @@ class CameraStreamer:
                 f"&ha_username={quote_plus(str(self.integration.ha_username or ''))}"
                 f"&ha_password={quote_plus(str(self.integration.ha_password or ''))}"
             )
-            
+
             logger.info(f"Connecting to stream relay: {ws_url[:80]}...")
-            
+
             self.ws = websocket.create_connection(
                 ws_url,
                 timeout=30,
-                header=["User-Agent: MinHustomte-HA-Addon/1.0"]
+                header=["User-Agent: MinHustomte-HA-Addon/1.0"],
             )
-            
+
+            # Ensure recv() doesn't block forever (lets us keep the loop responsive)
+            try:
+                self.ws.settimeout(30)
+            except Exception:
+                pass
+
             logger.info(f"Connected to stream relay for {self.entity_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to stream relay: {e}")
             return False
@@ -151,29 +401,39 @@ class CameraStreamer:
     def _send_frames(self):
         """Send camera frames to connected viewers."""
         frames_sent = 0
-        
+        last_ping = 0.0
+
         while self.running and self.ws and self.ws.connected:
             try:
+                now = time.time()
+                # Keepalive ping every 15s to reduce idle disconnects
+                if now - last_ping > 15:
+                    try:
+                        self.ws.ping()
+                    except Exception:
+                        pass
+                    last_ping = now
+
                 # Get frame from camera
                 frame_data = self._get_camera_frame()
-                
+
                 if frame_data:
                     # Send as binary
                     self.ws.send_binary(frame_data)
                     frames_sent += 1
-                    
+
                     if frames_sent % 100 == 0:
                         logger.debug(f"Sent {frames_sent} frames for {self.entity_id}")
-                
+
                 time.sleep(self.frame_interval)
-                
+
             except websocket.WebSocketConnectionClosedException:
                 logger.info(f"WebSocket closed, stopping frame sending")
                 break
             except Exception as e:
                 logger.error(f"Error sending frame: {e}")
                 break
-        
+
         logger.info(f"Frame sending ended, total frames: {frames_sent}")
 
 
@@ -187,6 +447,7 @@ class MinHustomteIntegration:
         self.api_endpoint = None
         self.credentials_file = '/data/minhustomte_credentials.json'
         self.camera_streamers = {}
+        self.tunnel_client = None
         self.load_config()
     
     def load_config(self):
@@ -451,6 +712,8 @@ minhustomte:
                 entity_id = state.get('entity_id', '')
                 attributes = state.get('attributes', {})
                 device_class = attributes.get('device_class', '')
+                friendly_name = attributes.get('friendly_name', '')
+                unit = attributes.get('unit_of_measurement', '')
                 state_value = state.get('state', '')
                 
                 if state_value in ['unavailable', 'unknown', '']:
@@ -461,52 +724,67 @@ minhustomte:
                 except (ValueError, TypeError):
                     continue
                 
+                # Check both entity_id and friendly_name for matching
                 entity_lower = entity_id.lower()
+                name_lower = friendly_name.lower()
+                search_text = f"{entity_lower} {name_lower}"
                 
-                if device_class == 'power' or 'power' in entity_lower:
-                    if 'total' not in entity_lower and electricity_data['current_power'] is None:
-                        electricity_data['current_power'] = value
-                        logger.debug(f"Found current power: {entity_id} = {value}")
+                # Power sensors (W or kW)
+                is_power = device_class == 'power' or unit in ['W', 'kW'] or 'power' in entity_lower or 'effekt' in name_lower
+                if is_power:
+                    if 'total' not in search_text and electricity_data['current_power'] is None:
+                        electricity_data['current_power'] = value if unit != 'kW' else value * 1000
+                        logger.debug(f"Found current power: {entity_id} ({friendly_name}) = {value}")
                 
-                if device_class == 'energy' or 'energy' in entity_lower or 'kwh' in entity_lower:
-                    if 'today' in entity_lower or 'daily' in entity_lower:
+                # Energy sensors (kWh)
+                is_energy = device_class == 'energy' or unit == 'kWh' or 'energy' in search_text or 'energi' in search_text
+                if is_energy:
+                    if 'today' in search_text or 'daily' in search_text or 'idag' in search_text or 'dygn' in search_text:
                         electricity_data['today_usage'] = value
-                    elif 'month' in entity_lower:
+                    elif 'month' in search_text or 'månad' in search_text:
                         electricity_data['month_usage'] = value
-                    elif 'import' in entity_lower or 'consumption' in entity_lower:
+                    elif 'import' in search_text or 'consumption' in search_text or 'förbrukning' in search_text:
                         electricity_data['total_import'] = value
-                    elif 'export' in entity_lower:
+                    elif 'export' in search_text:
                         electricity_data['total_export'] = value
                 
-                if device_class == 'voltage' or 'voltage' in entity_lower:
-                    if 'l1' in entity_lower or 'phase_1' in entity_lower:
+                # Voltage sensors (V)
+                is_voltage = device_class == 'voltage' or unit == 'V' or 'voltage' in search_text or 'spänning' in search_text
+                if is_voltage:
+                    if 'l1' in search_text or 'phase_1' in search_text or 'fas_1' in search_text or 'fas 1' in search_text:
                         electricity_data['phase_l1_voltage'] = value
-                    elif 'l2' in entity_lower or 'phase_2' in entity_lower:
+                    elif 'l2' in search_text or 'phase_2' in search_text or 'fas_2' in search_text or 'fas 2' in search_text:
                         electricity_data['phase_l2_voltage'] = value
-                    elif 'l3' in entity_lower or 'phase_3' in entity_lower:
+                    elif 'l3' in search_text or 'phase_3' in search_text or 'fas_3' in search_text or 'fas 3' in search_text:
                         electricity_data['phase_l3_voltage'] = value
                     elif electricity_data['voltage'] is None:
                         electricity_data['voltage'] = value
                 
-                if device_class == 'current' or 'current' in entity_lower or 'ampere' in entity_lower:
-                    if 'l1' in entity_lower or 'phase_1' in entity_lower:
+                # Current sensors (A)
+                is_current = device_class == 'current' or unit == 'A' or 'current' in search_text or 'ampere' in search_text or 'ström' in search_text
+                if is_current:
+                    if 'l1' in search_text or 'phase_1' in search_text or 'fas_1' in search_text or 'fas 1' in search_text:
                         electricity_data['phase_l1_current'] = value
-                    elif 'l2' in entity_lower or 'phase_2' in entity_lower:
+                    elif 'l2' in search_text or 'phase_2' in search_text or 'fas_2' in search_text or 'fas 2' in search_text:
                         electricity_data['phase_l2_current'] = value
-                    elif 'l3' in entity_lower or 'phase_3' in entity_lower:
+                    elif 'l3' in search_text or 'phase_3' in search_text or 'fas_3' in search_text or 'fas 3' in search_text:
                         electricity_data['phase_l3_current'] = value
                     elif electricity_data['current_amps'] is None:
                         electricity_data['current_amps'] = value
                 
-                if 'power' in entity_lower:
-                    if 'l1' in entity_lower or 'phase_1' in entity_lower:
-                        electricity_data['phase_l1_power'] = value
-                    elif 'l2' in entity_lower or 'phase_2' in entity_lower:
-                        electricity_data['phase_l2_power'] = value
-                    elif 'l3' in entity_lower or 'phase_3' in entity_lower:
-                        electricity_data['phase_l3_power'] = value
+                # Phase power sensors (W) - check friendly_name for "Effekt Fas X"
+                if is_power:
+                    if 'l1' in search_text or 'phase_1' in search_text or 'fas_1' in search_text or 'fas 1' in search_text:
+                        electricity_data['phase_l1_power'] = value if unit != 'kW' else value * 1000
+                        logger.debug(f"Found L1 power: {friendly_name} = {value}")
+                    elif 'l2' in search_text or 'phase_2' in search_text or 'fas_2' in search_text or 'fas 2' in search_text:
+                        electricity_data['phase_l2_power'] = value if unit != 'kW' else value * 1000
+                        logger.debug(f"Found L2 power: {friendly_name} = {value}")
+                    elif 'l3' in search_text or 'phase_3' in search_text or 'fas_3' in search_text or 'fas 3' in search_text:
+                        electricity_data['phase_l3_power'] = value if unit != 'kW' else value * 1000
+                        logger.debug(f"Found L3 power: {friendly_name} = {value}")
                 
-                if 'power_factor' in entity_lower or device_class == 'power_factor':
+                if 'power_factor' in search_text or device_class == 'power_factor':
                     electricity_data['power_factor'] = value
             
             return electricity_data
@@ -651,6 +929,21 @@ minhustomte:
             streamer.stop()
         self.camera_streamers.clear()
     
+    def start_tunnel_client(self):
+        """Start the HA tunnel client for portal requests."""
+        if self.tunnel_client:
+            self.tunnel_client.stop()
+        
+        self.tunnel_client = TunnelClient(self)
+        self.tunnel_client.start()
+        logger.info("HA tunnel client started")
+    
+    def stop_tunnel_client(self):
+        """Stop the HA tunnel client."""
+        if self.tunnel_client:
+            self.tunnel_client.stop()
+            self.tunnel_client = None
+    
     def run(self):
         """Main run loop."""
         logger.info("Starting MinHustomte Integration")
@@ -674,6 +967,9 @@ minhustomte:
         
         # Start camera streamers
         self.start_camera_streamers()
+        
+        # Start tunnel client for portal requests
+        self.start_tunnel_client()
         
         # Get sync intervals from config
         electricity_interval = self.config.get('electricity_sync_interval', 60)
@@ -709,6 +1005,7 @@ minhustomte:
                 
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
+                self.stop_tunnel_client()
                 self.stop_camera_streamers()
                 break
             except Exception as e:
