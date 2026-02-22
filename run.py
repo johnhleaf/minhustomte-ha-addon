@@ -129,6 +129,18 @@ class TunnelClient:
                 service_data = request_data.get('service_data', {})
                 result = self._call_service(domain, service, service_data)
             
+            elif action == 'get_camera_image':
+                entity_id = request_data.get('entity_id')
+                result = self._get_camera_image(entity_id)
+            
+            elif action == 'start_camera_stream':
+                entity_id = request_data.get('entity_id')
+                result = self._start_camera_stream(entity_id)
+            
+            elif action == 'stop_camera_stream':
+                entity_id = request_data.get('entity_id')
+                result = self._stop_camera_stream(entity_id)
+            
             else:
                 error = f"Unknown action: {action}"
             
@@ -275,10 +287,68 @@ class TunnelClient:
                 
         except Exception as e:
             return {'error': str(e)}
+    
+    def _get_camera_image(self, entity_id):
+        """Get a snapshot from a camera entity and return as base64."""
+        try:
+            ha_url = self.integration.get_ha_api_url()
+            headers = self.integration.get_ha_headers()
+            
+            response = requests.get(
+                f"{ha_url}/camera_proxy/{entity_id}",
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                image_base64 = base64.b64encode(response.content).decode('utf-8')
+                content_type = response.headers.get('Content-Type', 'image/jpeg')
+                return {
+                    'image': image_base64,
+                    'content_type': content_type,
+                    'entity_id': entity_id,
+                    'timestamp': datetime.now().isoformat()
+                }
+            else:
+                return {'error': f"Camera proxy error: {response.status_code}"}
+                
+        except Exception as e:
+            return {'error': str(e)}
+
+    def _start_camera_stream(self, entity_id):
+        """Start streaming a camera via Realtime broadcast."""
+        if not entity_id:
+            return {'error': 'Missing entity_id'}
+        
+        # Use the integration's camera streamers dict
+        if entity_id in self.integration.camera_streamers:
+            streamer = self.integration.camera_streamers[entity_id]
+            if streamer.running:
+                return {'success': True, 'message': 'Stream already running'}
+            streamer.stop()
+        
+        streamer = RealtimeCameraStreamer(self.integration, entity_id)
+        if streamer.start():
+            self.integration.camera_streamers[entity_id] = streamer
+            return {'success': True, 'message': f'Started stream for {entity_id}'}
+        else:
+            return {'error': f'Failed to start stream for {entity_id}'}
+    
+    def _stop_camera_stream(self, entity_id):
+        """Stop streaming a camera."""
+        if not entity_id:
+            return {'error': 'Missing entity_id'}
+        
+        if entity_id in self.integration.camera_streamers:
+            self.integration.camera_streamers[entity_id].stop()
+            del self.integration.camera_streamers[entity_id]
+            return {'success': True, 'message': f'Stopped stream for {entity_id}'}
+        
+        return {'success': True, 'message': 'Stream was not running'}
 
 
-class CameraStreamer:
-    """Handles WebSocket streaming of camera frames to portal."""
+class RealtimeCameraStreamer:
+    """Streams camera frames via local server.js WebSocket relay."""
     
     def __init__(self, integration, entity_id):
         self.integration = integration
@@ -286,10 +356,16 @@ class CameraStreamer:
         self.ws = None
         self.running = False
         self.thread = None
-        self.frame_interval = 0.1  # 10 FPS
+        self.frame_interval = 0.5  # 2 FPS
+        # Build WebSocket URL to local server
+        # api_endpoint is like https://api.minhustomte.se
+        api_base = integration.api_endpoint or 'https://api.minhustomte.se'
+        ws_proto = 'wss' if api_base.startswith('https') else 'ws'
+        ws_host = api_base.replace('https://', '').replace('http://', '').rstrip('/')
+        self.ws_url = f"{ws_proto}://{ws_host}/ws/camera?role=provider&cabin_id={integration.cabin_id}&entity_id={entity_id}"
     
     def start(self):
-        """Start streaming camera frames."""
+        """Start streaming camera frames via local WebSocket relay."""
         if not WEBSOCKET_AVAILABLE:
             logger.error("WebSocket not available, cannot stream camera")
             return False
@@ -297,7 +373,7 @@ class CameraStreamer:
         self.running = True
         self.thread = threading.Thread(target=self._stream_loop, daemon=True)
         self.thread.start()
-        logger.info(f"Started camera streamer for {self.entity_id}")
+        logger.info(f"Started camera streamer for {self.entity_id} -> {self.ws_url}")
         return True
     
     def stop(self):
@@ -311,130 +387,71 @@ class CameraStreamer:
         self.ws = None
         logger.info(f"Stopped camera streamer for {self.entity_id}")
     
-    def _connect(self):
-        """Connect to portal WebSocket."""
-        try:
-            ws_url = (
-                f"wss://qqmxykhzatbdsabsarrd.functions.supabase.co/functions/v1/camera-stream"
-                f"?role=provider"
-                f"&cabin_id={quote_plus(str(self.integration.cabin_id or ''))}"
-                f"&entity_id={quote_plus(str(self.entity_id or ''))}"
-                f"&ha_username={quote_plus(str(self.integration.ha_username or ''))}"
-                f"&ha_password={quote_plus(str(self.integration.ha_password or ''))}"
-            )
-
-            logger.info(f"Connecting to stream relay: {ws_url[:80]}...")
-
-            self.ws = websocket.create_connection(
-                ws_url,
-                timeout=30,
-                header=["User-Agent: MinHustomte-HA-Addon/1.0"],
-            )
-
-            # Ensure recv() doesn't block forever (lets us keep the loop responsive)
-            try:
-                self.ws.settimeout(30)
-            except Exception:
-                pass
-
-            logger.info(f"Connected to stream relay for {self.entity_id}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to connect to stream relay: {e}")
-            return False
-    
     def _get_camera_frame(self):
         """Get current camera frame from Home Assistant."""
         try:
-            # Use camera.get_image service or direct API
             response = requests.get(
                 f"{self.integration.get_ha_api_url()}/camera_proxy/{self.entity_id}",
                 headers=self.integration.get_ha_headers(),
                 timeout=10
             )
-            
             if response.status_code == 200:
                 return response.content
-            else:
-                logger.warning(f"Failed to get camera frame: {response.status_code}")
-                return None
-                
+            return None
         except Exception as e:
             logger.error(f"Error getting camera frame: {e}")
             return None
     
     def _stream_loop(self):
-        """Main streaming loop."""
+        """Main streaming loop - connect to local server and push frames."""
         reconnect_delay = 5
         
         while self.running:
             try:
-                # Connect if not connected
-                if not self.ws or not self.ws.connected:
-                    if not self._connect():
-                        time.sleep(reconnect_delay)
-                        continue
+                logger.info(f"Connecting to relay: {self.ws_url}")
+                self.ws = websocket.create_connection(
+                    self.ws_url,
+                    timeout=30,
+                    header=["User-Agent: MinHustomte-HA-Addon/1.0"],
+                )
+                self.ws.settimeout(5)
+                logger.info(f"Connected to relay for {self.entity_id}")
                 
-                # Wait for start_stream command
-                try:
-                    msg = self.ws.recv()
-                    data = json.loads(msg)
-                    
-                    if data.get('type') == 'start_stream':
-                        logger.info(f"Received start_stream command for {self.entity_id}")
-                        self._send_frames()
-                    
-                except websocket.WebSocketTimeoutException:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error receiving message: {e}")
-                    self.ws = None
-                    time.sleep(reconnect_delay)
-                    
+                self._send_frames()
+                
             except Exception as e:
-                logger.error(f"Stream loop error: {e}")
+                logger.error(f"Stream loop error for {self.entity_id}: {e}")
+                self.ws = None
                 time.sleep(reconnect_delay)
         
         logger.info(f"Stream loop ended for {self.entity_id}")
     
     def _send_frames(self):
-        """Send camera frames to connected viewers."""
+        """Send camera frames as binary JPEG to the relay."""
         frames_sent = 0
-        last_ping = 0.0
-
-        while self.running and self.ws and self.ws.connected:
+        
+        while self.running and self.ws:
             try:
-                now = time.time()
-                # Keepalive ping every 15s to reduce idle disconnects
-                if now - last_ping > 15:
-                    try:
-                        self.ws.ping()
-                    except Exception:
-                        pass
-                    last_ping = now
-
-                # Get frame from camera
-                frame_data = self._get_camera_frame()
-
-                if frame_data:
-                    # Send as binary
-                    self.ws.send_binary(frame_data)
+                frame = self._get_camera_frame()
+                if frame:
+                    # Send as binary directly - no base64 encoding needed
+                    self.ws.send_binary(frame)
                     frames_sent += 1
-
-                    if frames_sent % 100 == 0:
-                        logger.debug(f"Sent {frames_sent} frames for {self.entity_id}")
-
+                    
+                    if frames_sent % 30 == 0:
+                        logger.info(f"Streamed {frames_sent} frames for {self.entity_id}")
+                
                 time.sleep(self.frame_interval)
-
+                
             except websocket.WebSocketConnectionClosedException:
-                logger.info(f"WebSocket closed, stopping frame sending")
+                logger.info(f"Relay WebSocket closed for {self.entity_id}")
+                self.ws = None
                 break
             except Exception as e:
                 logger.error(f"Error sending frame: {e}")
                 break
-
-        logger.info(f"Frame sending ended, total frames: {frames_sent}")
+        
+        logger.info(f"Frame sending ended for {self.entity_id}, total: {frames_sent}")
 
 
 class MinHustomteIntegration:
@@ -907,21 +924,14 @@ minhustomte:
             return False
     
     def start_camera_streamers(self):
-        """Start streaming for all available cameras."""
+        """Start streaming for all available cameras via Realtime broadcast."""
         if not WEBSOCKET_AVAILABLE:
             logger.warning("WebSocket not available, camera streaming disabled")
             return
         
-        cameras = self.get_cameras()
-        
-        for camera in cameras:
-            entity_id = camera['entity_id']
-            
-            if entity_id not in self.camera_streamers:
-                streamer = CameraStreamer(self, entity_id)
-                if streamer.start():
-                    self.camera_streamers[entity_id] = streamer
-                    logger.info(f"Started streamer for {entity_id}")
+        # Camera streamers are now started on-demand via tunnel requests
+        # (start_camera_stream / stop_camera_stream actions)
+        logger.info("Camera streaming available on-demand via tunnel requests")
     
     def stop_camera_streamers(self):
         """Stop all camera streamers."""
