@@ -1,0 +1,7 @@
+configuration:
+  auth_code:
+    name: AUTH code
+    description: One-time pairing code created in MinHustomte HQ.
+  server_url:
+    name: Server URL
+    description: MinHustomte portal URL.

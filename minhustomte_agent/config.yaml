@@ -1,0 +1,29 @@
+name: "MinHustomte Hub Agent"
+version: "3.0.0"
+slug: "minhustomte_agent"
+description: "Säker utgående brygga mellan Home Assistant och MinHustomte."
+url: "https://minhustomte.se"
+arch:
+  - aarch64
+  - amd64
+startup: application
+boot: auto
+init: false
+homeassistant_api: true
+hassio_api: true
+hassio_role: default
+options:
+  auth_code: ""
+  server_url: "https://portal.minhustomte.se"
+  heartbeat_interval: 30
+  entity_sync_interval: 300
+  camera_fps: 4
+  debug: false
+schema:
+  auth_code: "str?"
+  server_url: "url"
+  heartbeat_interval: "int(10,300)"
+  entity_sync_interval: "int(60,3600)"
+  camera_fps: "int(1,10)"
+  debug: "bool"
+image: "ghcr.io/johnhleaf/minhustomte-ha-addon"
