@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.1.1
+- Stänger av WebSocket-komprimering mot MinHustomte för kompatibilitet med websocket-client.
+- Stabilare exponentiell reconnect-backoff; återställs först efter en stabil anslutning.
+- Tydligare HTTP-fel från entity sync.
+
 ## 3.1.0
 - Stöd för MinHustomte-hanterad Lovelace-dashboard via Home Assistants WebSocket API.
 - Skapar endast en separat `minhustomte-home` storage-dashboard och rör aldrig Overview.
