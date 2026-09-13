@@ -6,3 +6,9 @@
 4. Starta add-onen.
 
 AUTH-CODE används endast vid första parkopplingen. Därefter sparas en unik hub-token lokalt. Om hubben kopplas bort i HQ måste den paras om.
+
+
+## MinHustomte Dashboard
+Agent 3.1.0 kan skapa en separat Home Assistant storage-dashboard via Home Assistants interna WebSocket-API.
+Publicering görs från **MinHustomte HQ → Stuga → Home Assistant – Dashboard & design**.
+Dashboarden får URL `minhustomte-home`; Overview ändras inte.

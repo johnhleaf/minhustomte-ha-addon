@@ -4,7 +4,7 @@ from pathlib import Path
 from urllib.parse import urlparse,urlencode
 import requests, websocket
 
-DATA=Path('/data'); OPT=DATA/'options.json'; CREDS=DATA/'credentials.json'
+DATA=Path('/data'); OPT=DATA/'options.json'; CREDS=DATA/'credentials.json'; DASHSTATE=DATA/'dashboard-state.json'
 log=logging.getLogger('minhustomte-agent')
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 
@@ -38,7 +38,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.0.0','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.0','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -61,18 +61,77 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if e['state']=='unavailable' else 'online','supports_stream':True})
-            requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.0.0','ha_version':self.supervisor_info().get('version')},timeout=30)
+            requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.0','ha_version':self.supervisor_info().get('version')},timeout=30)
             self.send_json({'type':'entity_snapshot','entities':es})
         except Exception as e: log.warning('Entity sync failed: %s',e)
+    def ha_ws_command(self,payload,timeout=20):
+        token=os.environ.get('SUPERVISOR_TOKEN','')
+        if not token: raise RuntimeError('SUPERVISOR_TOKEN saknas')
+        ws=websocket.create_connection('ws://supervisor/core/websocket',timeout=timeout)
+        try:
+            first=json.loads(ws.recv())
+            if first.get('type')!='auth_required': raise RuntimeError('Home Assistant WebSocket gav oväntat auth-svar')
+            ws.send(json.dumps({'type':'auth','access_token':token}))
+            auth=json.loads(ws.recv())
+            if auth.get('type')!='auth_ok': raise RuntimeError('Home Assistant WebSocket-autentisering misslyckades')
+            msg=dict(payload); msg['id']=int(time.time()*1000)%2000000000
+            ws.send(json.dumps(msg,separators=(',',':')))
+            while True:
+                out=json.loads(ws.recv())
+                if out.get('id')!=msg['id']: continue
+                if not out.get('success'): raise RuntimeError((out.get('error') or {}).get('message') or 'Home Assistant WebSocket-kommandot misslyckades')
+                return out.get('result')
+        finally:
+            try: ws.close()
+            except: pass
+    def dashboard_state(self):
+        try:return json.loads(DASHSTATE.read_text()) if DASHSTATE.exists() else {}
+        except:return {}
+    def save_dashboard_state(self,state):
+        DASHSTATE.write_text(json.dumps(state,indent=2)); os.chmod(DASHSTATE,0o600)
+    def dashboard_list(self):
+        return self.ha_ws_command({'type':'lovelace/dashboards/list'}) or []
+    def dashboard_get(self,url_path):
+        return self.ha_ws_command({'type':'lovelace/config','url_path':url_path})
+    def dashboard_status(self,url_path):
+        rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.0'}
+    def dashboard_apply(self,req):
+        url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
+        if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
+        rows=self.dashboard_list(); existing=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
+        if existing and not (st.get('managed') and st.get('url_path')==url_path): raise RuntimeError('Det finns redan en Home Assistant-dashboard med denna URL som inte ägs av MinHustomte')
+        created=False
+        if not existing:
+            self.ha_ws_command({'type':'lovelace/dashboards/create','url_path':url_path,'title':str(req.get('title') or 'MinHustomte'),'icon':str(req.get('icon') or 'mdi:home-heart'),'show_in_sidebar':bool(req.get('show_in_sidebar',True)),'require_admin':False}); created=True
+        else:
+            try:self.ha_ws_command({'type':'lovelace/dashboards/update','dashboard_id':existing.get('id'),'title':str(req.get('title') or 'MinHustomte'),'icon':str(req.get('icon') or 'mdi:home-heart'),'show_in_sidebar':bool(req.get('show_in_sidebar',True)),'require_admin':False})
+            except Exception as e: log.debug('dashboard metadata update skipped: %s',e)
+        self.ha_ws_command({'type':'lovelace/config/save','url_path':url_path,'config':cfg},timeout=30)
+        state={'managed':True,'created_by_minhustomte':True,'url_path':url_path,'dashboard_version':req.get('dashboard_version'),'last_published_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+        self.save_dashboard_state(state)
+        return {'created':created,'url_path':url_path,'managed':True,'dashboard_version':state['dashboard_version'],'last_published_at':state['last_published_at']}
+    def dashboard_remove(self,url_path):
+        st=self.dashboard_state()
+        if not (st.get('managed') and st.get('url_path')==url_path): return {'removed':False,'reason':'not_managed'}
+        rows=self.dashboard_list(); existing=next((x for x in rows if x.get('url_path')==url_path),None)
+        if existing:
+            self.ha_ws_command({'type':'lovelace/dashboards/delete','dashboard_id':existing.get('id')})
+        try:DASHSTATE.unlink()
+        except FileNotFoundError:pass
+        return {'removed':bool(existing),'url_path':url_path}
     def rpc(self,req):
         action=req.get('action')
+        if action=='dashboard_status': return self.dashboard_status(str(req.get('url_path') or 'minhustomte-home'))
+        if action=='dashboard_apply': return self.dashboard_apply(req)
+        if action=='dashboard_remove': return self.dashboard_remove(str(req.get('url_path') or 'minhustomte-home'))
         if action=='ping': return {'pong':True,'ts':time.time()}
         if action=='list_entities':
             es=self.slim_entities(); f=req.get('filter') or {}; return {'entities':[e for e in es if not f.get('domain') or e['domain']==f['domain']],'count':len(es)}
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.0.0','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.0','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='get_camera_snapshot':
             r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20);r.raise_for_status();import base64;return {'content_type':r.headers.get('content-type','image/jpeg'),'base64':base64.b64encode(r.content).decode()}
         if action=='start_camera_stream': self.start_stream(req); return {'started':True,'stream_id':req['stream_id']}
@@ -103,7 +162,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.0.0','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.0','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
