@@ -19,3 +19,7 @@
 - Entity discovery/sync.
 - Kamera JPEG-stream över binär WebSocket.
 - Persistent hub-token efter AUTH-CODE-parkoppling.
+
+## 3.1.2
+- Flyttar `Sec-WebSocket-Extensions`-headern till `WebSocketApp(...)`; `run_forever()` stöder inte `header=` i den installerade websocket-client-versionen.
+- Behåller reconnect-backoff och tydliga entity-sync-fel från 3.1.1.
