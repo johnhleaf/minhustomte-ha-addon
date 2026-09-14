@@ -1,3 +1,8 @@
+## 3.1.3
+- Dashboard Design V2-stöd.
+- Kan läsa och sätta MinHustomte som systemets standarddashboard via Home Assistants frontend storage API.
+- Återställer Overview innan en standard-Minhustomte-dashboard tas bort.
+
 # Changelog
 
 ## 3.1.1

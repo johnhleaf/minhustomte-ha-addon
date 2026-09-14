@@ -38,7 +38,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.2','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.3','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -61,7 +61,7 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if e['state']=='unavailable' else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.2','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.3','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
             self.send_json({'type':'entity_snapshot','entities':es})
         except Exception as e: log.warning('Entity sync failed: %s',e)
@@ -94,9 +94,23 @@ class Agent:
         return self.ha_ws_command({'type':'lovelace/dashboards/list'}) or []
     def dashboard_get(self,url_path):
         return self.ha_ws_command({'type':'lovelace/config','url_path':url_path})
+    def frontend_core_data(self):
+        out=self.ha_ws_command({'type':'frontend/get_system_data','key':'core'}) or {}
+        value=out.get('value') if isinstance(out,dict) else None
+        return value if isinstance(value,dict) else {}
+    def dashboard_is_system_default(self,url_path):
+        try:return self.frontend_core_data().get('default_panel')==url_path
+        except Exception as e:
+            log.debug('Kunde inte läsa systemets standarddashboard: %s',e); return False
+    def dashboard_set_default(self,url_path,enabled=True):
+        core=self.frontend_core_data(); current=core.get('default_panel')
+        target=url_path if enabled else ('lovelace' if current==url_path else current)
+        if target is None: target='lovelace'
+        self.ha_ws_command({'type':'frontend/set_system_data','key':'core','value':{**core,'default_panel':target}})
+        return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.2'}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.3','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -117,6 +131,7 @@ class Agent:
         if not (st.get('managed') and st.get('url_path')==url_path): return {'removed':False,'reason':'not_managed'}
         rows=self.dashboard_list(); existing=next((x for x in rows if x.get('url_path')==url_path),None)
         if existing:
+            if self.dashboard_is_system_default(url_path): self.dashboard_set_default(url_path,False)
             self.ha_ws_command({'type':'lovelace/dashboards/delete','dashboard_id':existing.get('id')})
         try:DASHSTATE.unlink()
         except FileNotFoundError:pass
@@ -125,6 +140,7 @@ class Agent:
         action=req.get('action')
         if action=='dashboard_status': return self.dashboard_status(str(req.get('url_path') or 'minhustomte-home'))
         if action=='dashboard_apply': return self.dashboard_apply(req)
+        if action=='dashboard_set_default': return self.dashboard_set_default(str(req.get('url_path') or 'minhustomte-home'),req.get('enabled') is not False)
         if action=='dashboard_remove': return self.dashboard_remove(str(req.get('url_path') or 'minhustomte-home'))
         if action=='ping': return {'pong':True,'ts':time.time()}
         if action=='list_entities':
@@ -132,7 +148,7 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.2','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.3','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='get_camera_snapshot':
             r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20);r.raise_for_status();import base64;return {'content_type':r.headers.get('content-type','image/jpeg'),'base64':base64.b64encode(r.content).decode()}
         if action=='start_camera_stream': self.start_stream(req); return {'started':True,'stream_id':req['stream_id']}
@@ -163,7 +179,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.2','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.3','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
