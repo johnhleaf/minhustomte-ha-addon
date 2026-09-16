@@ -9,10 +9,10 @@ AUTH-CODE används endast vid första parkopplingen. Därefter sparas en unik hu
 
 
 ## MinHustomte Dashboard
-Agent 3.1.3 kan skapa en separat Home Assistant storage-dashboard via Home Assistants interna WebSocket-API.
+Agent 3.1.4 kan skapa en separat Home Assistant storage-dashboard via Home Assistants interna WebSocket-API.
 Publicering görs från **MinHustomte HQ → Stuga → Home Assistant – Dashboard & design**.
 Dashboarden får URL `minhustomte-home`; Overview ändras inte.
 
 
 ## Standarddashboard
-Agent 3.1.3 kan via HQ sätta MinHustomte som Home Assistants systemstandard. Användarspecifika dashboardval i Home Assistant fortsätter att ha företräde.
+Agent 3.1.4 kan via HQ sätta MinHustomte som Home Assistants systemstandard. Användarspecifika dashboardval i Home Assistant fortsätter att ha företräde.

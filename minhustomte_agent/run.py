@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os,json,time,logging,threading,uuid,socket
+import os,json,time,logging,threading,uuid,socket,subprocess
 from pathlib import Path
 from urllib.parse import urlparse,urlencode
 import requests, websocket
@@ -38,7 +38,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.3','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.4','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -50,6 +50,55 @@ class Agent:
     def send_binary(self,b):
         with self.send_lock:
             if self.ws and self.ws.sock and self.ws.sock.connected:self.ws.send_binary(b)
+    def camera_status(self,stream_id,status,method=None,error=None):
+        self.send_json({'type':'camera_stream_status','stream_id':stream_id,'status':status,'method':method,'error':error})
+    def camera_hls_url(self,entity_id):
+        result=self.ha_ws_command({'type':'camera/stream','entity_id':entity_id,'format':'hls'},timeout=25) or {}
+        url=result.get('url') if isinstance(result,dict) else None
+        if not url: raise RuntimeError('Home Assistant returnerade ingen HLS-adress för kameran')
+        if url.startswith('http://') or url.startswith('https://'): return url
+        return 'http://supervisor/core'+('/' if not url.startswith('/') else '')+url
+    def stream_hls_frames(self,sid,entity,fps,stop,entry):
+        self.camera_status(sid,'trying_hls','hls')
+        url=self.camera_hls_url(entity)
+        token=os.environ.get('SUPERVISOR_TOKEN','')
+        cmd=['ffmpeg','-hide_banner','-loglevel','error','-headers',f'Authorization: Bearer {token}\r\n','-i',url,'-an','-vf',f'fps={fps}','-f','image2pipe','-vcodec','mjpeg','-q:v','5','pipe:1']
+        proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        entry['proc']=proc
+        buf=b''; first=True
+        try:
+            while self.running and not stop.is_set():
+                chunk=proc.stdout.read(8192) if proc.stdout else b''
+                if not chunk:
+                    if proc.poll() is not None: break
+                    time.sleep(.02); continue
+                buf+=chunk
+                while True:
+                    a=buf.find(b'\xff\xd8')
+                    if a<0:
+                        if len(buf)>1024*1024: buf=buf[-2:]
+                        break
+                    b=buf.find(b'\xff\xd9',a+2)
+                    if b<0:
+                        if a>0: buf=buf[a:]
+                        break
+                    frame=buf[a:b+2]; buf=buf[b+2:]
+                    if frame:
+                        self.send_binary(sid.encode('ascii')+frame)
+                        if first:
+                            self.camera_status(sid,'live','hls'); first=False
+            if first and not stop.is_set():
+                err=''
+                try: err=(proc.stderr.read() if proc.stderr else b'').decode('utf-8','replace')[-700:]
+                except: pass
+                raise RuntimeError('Home Assistant-livevideo gav inga bildrutor'+((': '+err.strip()) if err.strip() else ''))
+        finally:
+            try:
+                if proc.poll() is None: proc.terminate(); proc.wait(timeout=2)
+            except Exception:
+                try: proc.kill()
+                except: pass
+            entry['proc']=None
     def entities(self): return self.ha_get('/states')
     def slim_entities(self):
         out=[]
@@ -61,7 +110,7 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if e['state']=='unavailable' else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.3','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.4','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
             self.send_json({'type':'entity_snapshot','entities':es})
         except Exception as e: log.warning('Entity sync failed: %s',e)
@@ -110,7 +159,7 @@ class Agent:
         return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.3','is_system_default':self.dashboard_is_system_default(url_path)}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.4','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -148,27 +197,59 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.3','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.4','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='get_camera_snapshot':
-            r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20);r.raise_for_status();import base64;return {'content_type':r.headers.get('content-type','image/jpeg'),'base64':base64.b64encode(r.content).decode()}
+            r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20)
+            if not r.ok: raise RuntimeError(f'Home Assistant camera_proxy svarade HTTP {r.status_code}: {r.text[:240]}')
+            import base64;return {'content_type':r.headers.get('content-type','image/jpeg'),'base64':base64.b64encode(r.content).decode()}
         if action=='start_camera_stream': self.start_stream(req); return {'started':True,'stream_id':req['stream_id']}
         if action=='stop_camera_stream': self.stop_stream(req.get('stream_id')); return {'stopped':True}
         raise RuntimeError('Okänd åtgärd: '+str(action))
     def start_stream(self,req):
-        sid=req['stream_id']; self.stop_stream(sid); stop=threading.Event(); self.streams[sid]=stop; fps=max(1,min(int(req.get('fps') or self.cfg.get('camera_fps',4)),10)); entity=req['entity_id']
+        sid=req['stream_id']; self.stop_stream(sid)
+        stop=threading.Event(); entry={'stop':stop,'proc':None}; self.streams[sid]=entry
+        fps=max(1,min(int(req.get('fps') or self.cfg.get('camera_fps',4)),8)); entity=req['entity_id']
         def loop():
-            wait=1.0/fps
-            while self.running and not stop.is_set():
+            snapshot_error=None
+            self.camera_status(sid,'trying_snapshot','snapshot')
+            # Fast path: native/still image endpoint. Some Hikvision entities only expose a usable stream,
+            # so a 500 here is not fatal; we fall back to Home Assistant's HLS stream below.
+            consecutive=0; sent=0
+            while self.running and not stop.is_set() and consecutive<2:
                 t=time.time()
                 try:
-                    r=requests.get('http://supervisor/core/api/camera_proxy/'+entity,headers=self.ha_headers(),timeout=15)
-                    if r.ok and r.content:self.send_binary(sid.encode('ascii')+r.content)
-                except Exception as e: log.debug('camera frame: %s',e)
-                stop.wait(max(0.02,wait-(time.time()-t)))
+                    r=requests.get('http://supervisor/core/api/camera_proxy/'+entity,headers=self.ha_headers(),timeout=12)
+                    ctype=(r.headers.get('content-type') or '').lower()
+                    if r.ok and r.content and ('image/' in ctype or r.content[:2]==b'\xff\xd8'):
+                        self.send_binary(sid.encode('ascii')+r.content); sent+=1; consecutive=0
+                        if sent==1:self.camera_status(sid,'live','snapshot')
+                        # Keep snapshot relay if it works; it is cheap and compatible.
+                        stop.wait(max(.12,(1.0/fps)-(time.time()-t))); continue
+                    snapshot_error=f'camera_proxy HTTP {r.status_code}'
+                except Exception as e:
+                    snapshot_error=str(e)
+                consecutive+=1
+                if sent: stop.wait(.5)
+            if stop.is_set(): return
+            # If snapshots never worked, or stopped working twice, use the actual HA live stream.
+            try:
+                self.stream_hls_frames(sid,entity,fps,stop,entry)
+            except Exception as e:
+                if not stop.is_set():
+                    detail=str(e)
+                    if snapshot_error: detail=f'Stillbild misslyckades ({snapshot_error}). Livevideo misslyckades ({detail}).'
+                    log.warning('camera stream %s: %s',entity,detail)
+                    self.camera_status(sid,'error','hls',detail)
         threading.Thread(target=loop,daemon=True,name='camera-'+sid[:8]).start()
     def stop_stream(self,sid):
         x=self.streams.pop(sid,None)
-        if x:x.set()
+        if not x:return
+        stop=x.get('stop') if isinstance(x,dict) else x
+        if stop:stop.set()
+        proc=x.get('proc') if isinstance(x,dict) else None
+        if proc:
+            try: proc.terminate()
+            except: pass
     def on_message(self,ws,msg):
         try:
             m=json.loads(msg)
@@ -179,7 +260,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.3','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.4','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):

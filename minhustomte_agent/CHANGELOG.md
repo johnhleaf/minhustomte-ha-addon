@@ -1,3 +1,8 @@
+## 3.1.4
+- Kameror: fallback från `camera_proxy` till Home Assistants riktiga HLS-livevideo när stillbilds-API:t ger fel.
+- Kamerafel och vald streammetod rapporteras tillbaka till MinHustomte.
+- FFmpeg används lokalt i add-onen för att relay:a HLS som JPEG-rutor över den befintliga krypterade hubbkanalen.
+
 ## 3.1.3
 - Dashboard Design V2-stöd.
 - Kan läsa och sätta MinHustomte som systemets standarddashboard via Home Assistants frontend storage API.
