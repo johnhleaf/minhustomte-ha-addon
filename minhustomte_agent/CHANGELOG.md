@@ -1,3 +1,8 @@
+## 3.1.5
+
+- Fixar Home Assistant WebSocket-auth för `camera/stream`.
+- Förbättrar HLS/FFmpeg-diagnostik för kamerarelay.
+
 ## 3.1.4
 - Kameror: fallback från `camera_proxy` till Home Assistants riktiga HLS-livevideo när stillbilds-API:t ger fel.
 - Kamerafel och vald streammetod rapporteras tillbaka till MinHustomte.
