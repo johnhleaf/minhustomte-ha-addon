@@ -1,3 +1,9 @@
+## 3.1.6
+
+- Fixar kamerareläets binära WebSocket-sändning för den installerade `websocket-client`-versionen.
+- Använder `WebSocketApp.send(..., opcode=ABNF.OPCODE_BINARY)` i stället för den icke-existerande metoden `send_binary()`.
+- Gör att både stillbilds- och HLS-fallbacken kan skicka JPEG-rutor vidare till MinHustomte.
+
 ## 3.1.5
 
 - Fixar Home Assistant WebSocket-auth för `camera/stream`.
