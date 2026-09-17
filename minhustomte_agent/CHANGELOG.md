@@ -1,3 +1,7 @@
+## 3.1.7
+- Hikvision SD-kort: lokal ISAPI-konfiguration, sökning av inspelningar per datum och export av klipp via RTSP playback.
+- Hikvision-inloggning sparas endast lokalt i add-onens /data och skickas inte till MinHustomte-servern.
+
 ## 3.1.6
 
 - Fixar kamerareläets binära WebSocket-sändning för den installerade `websocket-client`-versionen.

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-import os,json,time,logging,threading,uuid,socket,subprocess
+import os,json,time,logging,threading,uuid,socket,subprocess,base64,tempfile,hashlib
 from pathlib import Path
-from urllib.parse import urlparse,urlencode
+from urllib.parse import urlparse,urlencode,urlsplit,urlunsplit,quote
 import requests, websocket
+from requests.auth import HTTPDigestAuth
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import xml.etree.ElementTree as ET
 
-DATA=Path('/data'); OPT=DATA/'options.json'; CREDS=DATA/'credentials.json'; DASHSTATE=DATA/'dashboard-state.json'
+DATA=Path('/data'); OPT=DATA/'options.json'; CREDS=DATA/'credentials.json'; DASHSTATE=DATA/'dashboard-state.json'; HIKCFG=DATA/'hikvision-playback.json'
 log=logging.getLogger('minhustomte-agent')
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 
@@ -38,7 +42,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.6','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.7','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -103,6 +107,100 @@ class Agent:
                 try: proc.kill()
                 except: pass
             entry['proc']=None
+    def hikvision_configs(self):
+        try:
+            data=json.loads(HIKCFG.read_text()) if HIKCFG.exists() else {}
+            return data if isinstance(data,dict) else {}
+        except Exception as e:
+            log.warning('Could not read Hikvision playback config: %s',e); return {}
+    def save_hikvision_configs(self,data):
+        HIKCFG.write_text(json.dumps(data,indent=2)); os.chmod(HIKCFG,0o600)
+    def hikvision_config(self,entity_id):
+        cfg=self.hikvision_configs().get(entity_id)
+        if not isinstance(cfg,dict): raise RuntimeError('Inspelningar är inte konfigurerade för den här kameran')
+        if not cfg.get('address') or not cfg.get('username') or not cfg.get('password'): raise RuntimeError('Hikvision-adress/användare/lösenord saknas')
+        return cfg
+    def hikvision_base_url(self,cfg):
+        address=str(cfg.get('address') or '').strip().rstrip('/')
+        if '://' in address:
+            p=urlparse(address); scheme=p.scheme; host=p.hostname or ''; port=p.port
+        else:
+            scheme='https' if cfg.get('https') else 'http'; host=address; port=None
+        if not host: raise RuntimeError('Ogiltig Hikvision-adress')
+        if port is None: port=int(cfg.get('http_port') or (443 if scheme=='https' else 80))
+        default=(scheme=='http' and port==80) or (scheme=='https' and port==443)
+        return f'{scheme}://{host}' + ('' if default else f':{port}')
+    def hikvision_auth(self,cfg): return HTTPDigestAuth(str(cfg.get('username')),str(cfg.get('password')))
+    def _xml_local(self,tag): return str(tag).split('}',1)[-1]
+    def hikvision_recordings(self,entity_id,date_str):
+        cfg=self.hikvision_config(entity_id); base=self.hikvision_base_url(cfg)
+        try: day=datetime.strptime(date_str,'%Y-%m-%d').replace(tzinfo=ZoneInfo('Europe/Stockholm'))
+        except: raise RuntimeError('Ogiltigt datum')
+        start=day.astimezone(timezone.utc); end=(day+timedelta(days=1)).astimezone(timezone.utc)
+        track=str(cfg.get('track_id') or '101'); sid=uuid.uuid4().hex
+        stxt=start.strftime('%Y-%m-%dT%H:%M:%SZ'); etxt=end.strftime('%Y-%m-%dT%H:%M:%SZ')
+        xml=(f'<CMSearchDescription><searchID>{sid}</searchID><trackList><trackID>{track}</trackID></trackList>'
+             f'<timeSpanList><timeSpan><startTime>{stxt}</startTime><endTime>{etxt}</endTime></timeSpan></timeSpanList>'
+             '<maxResults>200</maxResults><searchResultPostion>0</searchResultPostion>'
+             '<metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList></CMSearchDescription>')
+        r=requests.post(base+'/ISAPI/ContentMgmt/search',data=xml.encode(),headers={'Content-Type':'application/xml'},auth=self.hikvision_auth(cfg),timeout=25,verify=False)
+        if not r.ok: raise RuntimeError(f'Hikvision ISAPI search svarade HTTP {r.status_code}: {r.text[:240]}')
+        try: root=ET.fromstring(r.content)
+        except Exception as e: raise RuntimeError('Kunde inte tolka Hikvision söksvar: '+str(e))
+        items=[]
+        for node in root.iter():
+            if self._xml_local(node.tag) not in ('searchMatchItem','matchElement'): continue
+            vals={}
+            for x in node.iter():
+                key=self._xml_local(x.tag); txt=(x.text or '').strip()
+                if txt and key not in vals: vals[key]=txt
+            st=vals.get('startTime'); en=vals.get('endTime')
+            if not st or not en: continue
+            try:
+                ds=datetime.fromisoformat(st.replace('Z','+00:00')); de=datetime.fromisoformat(en.replace('Z','+00:00')); dur=max(0,int((de-ds).total_seconds()))
+                local_s=ds.astimezone(ZoneInfo('Europe/Stockholm')).isoformat(); local_e=de.astimezone(ZoneInfo('Europe/Stockholm')).isoformat()
+            except: dur=0; local_s=st; local_e=en
+            uri=vals.get('playbackURI') or vals.get('playbackUri') or ''
+            kind=vals.get('metadataDescriptor') or vals.get('recordType') or 'recording'
+            rid=hashlib.sha1((st+'|'+en+'|'+uri).encode()).hexdigest()[:16]
+            items.append({'id':rid,'start':st,'end':en,'start_local':local_s,'end_local':local_e,'duration_seconds':dur,'type':kind,'playback_uri':uri})
+        items.sort(key=lambda x:x.get('start',''))
+        return {'date':date_str,'count':len(items),'recordings':items,'source':'Hikvision SD-kort via ISAPI'}
+    def hikvision_rtsp_uri(self,cfg,start,end,playback_uri=''):
+        uri=str(playback_uri or '').strip(); rtsp_port=int(cfg.get('rtsp_port') or 554); track=str(cfg.get('track_id') or '101')
+        address=str(cfg.get('address') or '').strip(); host=urlparse(address).hostname if '://' in address else address.split(':')[0]
+        if not uri:
+            def compact(v):
+                d=datetime.fromisoformat(str(v).replace('Z','+00:00')).astimezone(timezone.utc)
+                return d.strftime('%Y%m%dT%H%M%SZ')
+            uri=f'rtsp://{host}:{rtsp_port}/Streaming/tracks/{track}?starttime={compact(start)}&endtime={compact(end)}'
+        p=urlsplit(uri)
+        if p.scheme.lower()!='rtsp': raise RuntimeError('Hikvision returnerade en ogiltig playback-URI')
+        hostname=p.hostname or host; port=p.port or rtsp_port
+        user=quote(str(cfg.get('username')),safe=''); pw=quote(str(cfg.get('password')),safe='')
+        netloc=f'{user}:{pw}@{hostname}:{port}'
+        return urlunsplit(('rtsp',netloc,p.path,p.query,p.fragment))
+    def hikvision_fetch_recording(self,entity_id,start,end,playback_uri=''):
+        cfg=self.hikvision_config(entity_id)
+        try:
+            ds=datetime.fromisoformat(str(start).replace('Z','+00:00')); de=datetime.fromisoformat(str(end).replace('Z','+00:00')); duration=(de-ds).total_seconds()
+        except: raise RuntimeError('Ogiltig start- eller sluttid')
+        if duration<=0 or duration>900: raise RuntimeError('Klippet måste vara mellan 1 sekund och 15 minuter')
+        uri=self.hikvision_rtsp_uri(cfg,start,end,playback_uri)
+        fd,tmp=tempfile.mkstemp(prefix='mht-hik-',suffix='.mp4'); os.close(fd)
+        try:
+            cmd=['ffmpeg','-hide_banner','-loglevel','error','-rtsp_transport','tcp','-i',uri,'-t',str(min(duration+3,903)),'-map','0:v:0','-map','0:a?','-c','copy','-movflags','+faststart','-y',tmp]
+            proc=subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,timeout=min(180,max(45,int(duration)+35)))
+            if proc.returncode!=0 or not os.path.exists(tmp) or os.path.getsize(tmp)<1024:
+                err=(proc.stderr or b'').decode('utf-8','replace')[-700:]
+                raise RuntimeError('Hikvision playback kunde inte hämtas'+((': '+err.strip()) if err.strip() else ''))
+            size=os.path.getsize(tmp)
+            if size>48*1024*1024: raise RuntimeError('Klippet är större än 48 MB. Välj ett kortare klipp.')
+            data=Path(tmp).read_bytes()
+            return {'content_type':'video/mp4','size':len(data),'base64':base64.b64encode(data).decode()}
+        finally:
+            try: os.unlink(tmp)
+            except: pass
     def entities(self): return self.ha_get('/states')
     def slim_entities(self):
         out=[]
@@ -114,7 +212,7 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if e['state']=='unavailable' else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.6','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.7','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
             self.send_json({'type':'entity_snapshot','entities':es})
         except Exception as e: log.warning('Entity sync failed: %s',e)
@@ -163,7 +261,7 @@ class Agent:
         return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.6','is_system_default':self.dashboard_is_system_default(url_path)}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.7','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -201,13 +299,27 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.6','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.7','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='get_camera_snapshot':
             r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20)
             if not r.ok: raise RuntimeError(f'Home Assistant camera_proxy svarade HTTP {r.status_code}: {r.text[:240]}')
             import base64;return {'content_type':r.headers.get('content-type','image/jpeg'),'base64':base64.b64encode(r.content).decode()}
         if action=='start_camera_stream': self.start_stream(req); return {'started':True,'stream_id':req['stream_id']}
         if action=='stop_camera_stream': self.stop_stream(req.get('stream_id')); return {'stopped':True}
+        if action=='hikvision_playback_config_get':
+            cfg=self.hikvision_configs().get(req.get('entity_id')) or {}
+            return {'configured':bool(cfg.get('address') and cfg.get('username') and cfg.get('password')),'address':cfg.get('address',''),'username':cfg.get('username',''),'http_port':cfg.get('http_port',80),'https':bool(cfg.get('https')),'rtsp_port':cfg.get('rtsp_port',554),'track_id':cfg.get('track_id','101'),'password_saved':bool(cfg.get('password'))}
+        if action=='hikvision_playback_config_set':
+            entity=str(req.get('entity_id') or ''); address=str(req.get('address') or '').strip(); username=str(req.get('username') or '').strip()
+            if not entity.startswith('camera.') or not address or not username: raise RuntimeError('Kameraadress, entity och användarnamn krävs')
+            allcfg=self.hikvision_configs(); old=allcfg.get(entity) or {}; password=str(req.get('password') or '') or str(old.get('password') or '')
+            if not password: raise RuntimeError('Lösenord krävs första gången')
+            cfg={'address':address,'username':username,'password':password,'http_port':max(1,min(int(req.get('http_port') or 80),65535)),'https':bool(req.get('https')),'rtsp_port':max(1,min(int(req.get('rtsp_port') or 554),65535)),'track_id':str(req.get('track_id') or '101')[:16]}
+            base=self.hikvision_base_url(cfg); test=requests.get(base+'/ISAPI/System/deviceInfo',auth=self.hikvision_auth(cfg),timeout=12,verify=False)
+            if not test.ok: raise RuntimeError(f'Kunde inte logga in på Hikvision (HTTP {test.status_code})')
+            allcfg[entity]=cfg; self.save_hikvision_configs(allcfg); return {'success':True,'configured':True,'address':address,'username':username,'password_saved':True,'track_id':cfg['track_id']}
+        if action=='hikvision_recordings_list': return self.hikvision_recordings(req['entity_id'],req['date'])
+        if action=='hikvision_recording_fetch': return self.hikvision_fetch_recording(req['entity_id'],req['start'],req['end'],req.get('playback_uri') or '')
         raise RuntimeError('Okänd åtgärd: '+str(action))
     def start_stream(self,req):
         sid=req['stream_id']; self.stop_stream(sid)
@@ -264,7 +376,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.6','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.7','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
