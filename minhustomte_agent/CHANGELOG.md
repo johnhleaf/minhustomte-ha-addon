@@ -1,4 +1,5 @@
-## 3.1.8
+## 3.1.9
+- Kamerastatus tolkar även `unknown` och tom state som offline.
 - Prenumererar lokalt på Home Assistant `state_changed` för konfigurerade kameratriggers.
 - Samlar 1–5 stillbilder per händelse via Home Assistant camera_proxy och skickar bildserien över den autentiserade hubbkanalen.
 - Manuell `camera_ai_capture_now` för end-to-end-test från MinHustomte.
