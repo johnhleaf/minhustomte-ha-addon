@@ -1,3 +1,9 @@
+## 3.1.8
+- Prenumererar lokalt på Home Assistant `state_changed` för konfigurerade kameratriggers.
+- Samlar 1–5 stillbilder per händelse via Home Assistant camera_proxy och skickar bildserien över den autentiserade hubbkanalen.
+- Manuell `camera_ai_capture_now` för end-to-end-test från MinHustomte.
+- Ingen extern AI-analys görs i denna version.
+
 ## 3.1.7
 - Hikvision SD-kort: lokal ISAPI-konfiguration, sökning av inspelningar per datum och export av klipp via RTSP playback.
 - Hikvision-inloggning sparas endast lokalt i add-onens /data och skickas inte till MinHustomte-servern.

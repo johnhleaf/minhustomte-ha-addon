@@ -20,7 +20,7 @@ def ws_url(http_url,path):
 class Agent:
     def __init__(self):
         self.cfg=opts(); self.server=self.cfg.get('server_url','https://portal.minhustomte.se').rstrip('/')
-        self.token=None; self.cabin_id=None; self.hub_id=None; self.ws=None; self.running=True; self.streams={}; self.send_lock=threading.Lock()
+        self.token=None; self.cabin_id=None; self.hub_id=None; self.ws=None; self.running=True; self.streams={}; self.send_lock=threading.Lock(); self.ai_watch=[]; self.ai_lock=threading.Lock(); self.ai_last_trigger={}
         self.load_creds()
         if self.cfg.get('debug'): logging.getLogger().setLevel(logging.DEBUG)
     def load_creds(self):
@@ -42,7 +42,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.7','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.8','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -212,8 +212,13 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if e['state']=='unavailable' else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.7','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.8','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
+            try:
+                d=r.json(); watch=d.get('camera_ai_watch') or []
+                if isinstance(watch,list):
+                    with self.ai_lock:self.ai_watch=watch
+            except Exception: pass
             self.send_json({'type':'entity_snapshot','entities':es})
         except Exception as e: log.warning('Entity sync failed: %s',e)
     def ha_ws_command(self,payload,timeout=20):
@@ -261,7 +266,7 @@ class Agent:
         return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.7','is_system_default':self.dashboard_is_system_default(url_path)}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.8','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -287,6 +292,68 @@ class Agent:
         try:DASHSTATE.unlink()
         except FileNotFoundError:pass
         return {'removed':bool(existing),'url_path':url_path}
+    def camera_ai_snapshot(self,entity_id):
+        r=requests.get('http://supervisor/core/api/camera_proxy/'+entity_id,headers=self.ha_headers(),timeout=20)
+        if not r.ok or not r.content: raise RuntimeError(f'Home Assistant camera_proxy svarade HTTP {r.status_code}')
+        ctype=(r.headers.get('content-type') or 'image/jpeg').split(';')[0].strip().lower()
+        if ctype not in ('image/jpeg','image/png','image/webp'):
+            if r.content[:2]==b'\xff\xd8': ctype='image/jpeg'
+            else: raise RuntimeError('Kameran returnerade inte en bild')
+        if len(r.content)>8*1024*1024: raise RuntimeError('Kamerabilden är större än 8 MB')
+        return {'content_type':ctype,'base64':base64.b64encode(r.content).decode(),'captured_at':datetime.now(timezone.utc).isoformat()}
+    def camera_ai_capture(self,req):
+        entity=str(req.get('entity_id') or '')
+        if not entity.startswith('camera.'): raise RuntimeError('Ogiltig kamera för bildinsamling')
+        count=max(1,min(int(req.get('capture_count') or 3),5)); interval=max(150,min(int(req.get('capture_interval_ms') or 500),3000))/1000.0
+        images=[]
+        for i in range(count):
+            images.append(self.camera_ai_snapshot(entity))
+            if i<count-1: time.sleep(interval)
+        return {'entity_id':entity,'trigger_entity_id':req.get('trigger_entity_id'),'trigger_mode':req.get('trigger_mode') or 'manual','trigger_state':req.get('trigger_state'),'trigger_payload':req.get('trigger_payload') or {},'captured_at':datetime.now(timezone.utc).isoformat(),'images':images}
+    def camera_ai_send_capture(self,watch,event):
+        entity=watch.get('entity_id'); trigger=watch.get('trigger_entity_id')
+        key=f'{entity}|{trigger}'; now=time.monotonic()
+        if now-self.ai_last_trigger.get(key,0)<5:return
+        self.ai_last_trigger[key]=now
+        try:
+            data=self.camera_ai_capture({'entity_id':entity,'capture_count':watch.get('capture_count'),'capture_interval_ms':watch.get('capture_interval_ms'),'trigger_entity_id':trigger,'trigger_mode':watch.get('trigger_mode'),'trigger_state':event.get('new_state'),'trigger_payload':event})
+            data.update({'type':'camera_ai_capture','capture_id':uuid.uuid4().hex,'source':'ha_state_changed'})
+            self.send_json(data); log.info('AI-kamerahändelse %s <- %s: %s bilder',entity,trigger,len(data.get('images') or []))
+        except Exception as e: log.warning('AI-bildinsamling %s misslyckades: %s',entity,e)
+    def camera_ai_event_matches(self,watch,entity_id,old_state,new_state):
+        if not watch.get('enabled',True) or not watch.get('trigger_entity_id') or watch.get('trigger_entity_id')!=entity_id:return False
+        mode=str(watch.get('trigger_mode') or 'vehicle_event')
+        if mode=='manual':return False
+        if old_state==new_state:return False
+        domain=entity_id.split('.',1)[0]
+        if domain=='binary_sensor': return str(new_state).lower() in ('on','true','open','detected','motion')
+        if str(new_state).lower() in ('unknown','unavailable','none',''):return False
+        return True
+    def camera_ai_event_loop(self):
+        token=os.environ.get('SUPERVISOR_TOKEN','')
+        while self.running:
+            ws=None
+            try:
+                ws=websocket.create_connection('ws://supervisor/core/websocket',timeout=65)
+                first=json.loads(ws.recv())
+                if first.get('type')!='auth_required': raise RuntimeError('Home Assistant WebSocket gav oväntat auth-svar')
+                ws.send(json.dumps({'type':'auth','access_token':token})); auth=json.loads(ws.recv())
+                if auth.get('type')!='auth_ok': raise RuntimeError('Home Assistant WebSocket-auth misslyckades')
+                ws.send(json.dumps({'id':811733,'type':'subscribe_events','event_type':'state_changed'}))
+                while self.running:
+                    msg=json.loads(ws.recv())
+                    if msg.get('type')!='event':continue
+                    ev=(msg.get('event') or {}).get('data') or {}; eid=str(ev.get('entity_id') or ''); old=(ev.get('old_state') or {}).get('state'); ns=ev.get('new_state') or {}; new=ns.get('state')
+                    with self.ai_lock: watches=list(self.ai_watch)
+                    payload={'entity_id':eid,'old_state':old,'new_state':new,'attributes':ns.get('attributes') or {},'time_fired':(msg.get('event') or {}).get('time_fired')}
+                    for watch in watches:
+                        if self.camera_ai_event_matches(watch,eid,old,new): threading.Thread(target=self.camera_ai_send_capture,args=(watch,payload),daemon=True).start()
+            except Exception as e:
+                log.warning('AI trigger event stream: %s',e); time.sleep(5)
+            finally:
+                try:
+                    if ws:ws.close()
+                except:pass
     def rpc(self,req):
         action=req.get('action')
         if action=='dashboard_status': return self.dashboard_status(str(req.get('url_path') or 'minhustomte-home'))
@@ -299,7 +366,10 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.7','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.8','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='camera_ai_config_refresh':
+            self.sync_http(); return {'success':True,'watch_count':len(self.ai_watch)}
+        if action=='camera_ai_capture_now': return self.camera_ai_capture(req)
         if action=='get_camera_snapshot':
             r=requests.get('http://supervisor/core/api/camera_proxy/'+req['entity_id'],headers=self.ha_headers(),timeout=20)
             if not r.ok: raise RuntimeError(f'Home Assistant camera_proxy svarade HTTP {r.status_code}: {r.text[:240]}')
@@ -376,14 +446,14 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.7','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.8','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
         while self.running:self.sync_http();time.sleep(max(60,int(self.cfg.get('entity_sync_interval',300))))
     def run(self):
         if not self.token:self.pair()
-        threading.Thread(target=self.heartbeat_loop,daemon=True).start(); threading.Thread(target=self.sync_loop,daemon=True).start()
+        threading.Thread(target=self.heartbeat_loop,daemon=True).start(); threading.Thread(target=self.sync_loop,daemon=True).start(); threading.Thread(target=self.camera_ai_event_loop,daemon=True,name='camera-ai-events').start()
         backoff=2
         while self.running:
             connected_at=None
