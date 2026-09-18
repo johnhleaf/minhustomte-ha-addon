@@ -1,3 +1,11 @@
+## 3.1.11
+- Bildinsamling stöder nu 1–8 snapshots per händelse.
+- Fördröjning före första snapshot kan vara upp till 30 sekunder.
+
+## 3.1.10
+- Stöd för valbar fördröjning 0–15 sekunder mellan kamera-/HA-trigger och första AI-snapshot.
+- Bildintervallet mellan efterföljande snapshots påverkas inte.
+
 ## 3.1.9
 - Kamerastatus tolkar även `unknown` och tom state som offline.
 - Prenumererar lokalt på Home Assistant `state_changed` för konfigurerade kameratriggers.

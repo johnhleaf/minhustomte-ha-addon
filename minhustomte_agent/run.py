@@ -42,7 +42,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.9','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.11','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -212,7 +212,7 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if str(e.get('state') or '').lower() in ('unavailable','unknown','') else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.9','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.11','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
             try:
                 d=r.json(); watch=d.get('camera_ai_watch') or []
@@ -266,7 +266,7 @@ class Agent:
         return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.9','is_system_default':self.dashboard_is_system_default(url_path)}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.11','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -304,7 +304,9 @@ class Agent:
     def camera_ai_capture(self,req):
         entity=str(req.get('entity_id') or '')
         if not entity.startswith('camera.'): raise RuntimeError('Ogiltig kamera för bildinsamling')
-        count=max(1,min(int(req.get('capture_count') or 3),5)); interval=max(150,min(int(req.get('capture_interval_ms') or 500),3000))/1000.0
+        count=max(1,min(int(req.get('capture_count') or 3),8)); interval=max(150,min(int(req.get('capture_interval_ms') or 500),3000))/1000.0
+        delay=max(0,min(int(req.get('capture_delay_ms') or 0),30000))/1000.0
+        if delay: time.sleep(delay)
         images=[]
         for i in range(count):
             images.append(self.camera_ai_snapshot(entity))
@@ -316,7 +318,7 @@ class Agent:
         if now-self.ai_last_trigger.get(key,0)<5:return
         self.ai_last_trigger[key]=now
         try:
-            data=self.camera_ai_capture({'entity_id':entity,'capture_count':watch.get('capture_count'),'capture_interval_ms':watch.get('capture_interval_ms'),'trigger_entity_id':trigger,'trigger_mode':watch.get('trigger_mode'),'trigger_state':event.get('new_state'),'trigger_payload':event})
+            data=self.camera_ai_capture({'entity_id':entity,'capture_count':watch.get('capture_count'),'capture_interval_ms':watch.get('capture_interval_ms'),'capture_delay_ms':watch.get('capture_delay_ms'),'trigger_entity_id':trigger,'trigger_mode':watch.get('trigger_mode'),'trigger_state':event.get('new_state'),'trigger_payload':event})
             data.update({'type':'camera_ai_capture','capture_id':uuid.uuid4().hex,'source':'ha_state_changed'})
             self.send_json(data); log.info('AI-kamerahändelse %s <- %s: %s bilder',entity,trigger,len(data.get('images') or []))
         except Exception as e: log.warning('AI-bildinsamling %s misslyckades: %s',entity,e)
@@ -366,7 +368,7 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.9','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.11','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='camera_ai_config_refresh':
             self.sync_http(); return {'success':True,'watch_count':len(self.ai_watch)}
         if action=='camera_ai_capture_now': return self.camera_ai_capture(req)
@@ -446,7 +448,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.9','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.11','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
