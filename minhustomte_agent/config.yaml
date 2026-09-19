@@ -1,5 +1,5 @@
 name: "MinHustomte Hub Agent"
-version: "3.1.11"
+version: "3.1.12"
 slug: "minhustomte_agent"
 description: "Säker utgående brygga mellan Home Assistant och MinHustomte."
 url: "https://minhustomte.se"
@@ -26,4 +26,3 @@ schema:
   entity_sync_interval: "int(60,3600)"
   camera_fps: "int(1,10)"
   debug: "bool"
-image: "ghcr.io/johnhleaf/minhustomte-ha-addon"

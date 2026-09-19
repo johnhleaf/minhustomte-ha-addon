@@ -1,3 +1,8 @@
+## 3.1.12
+- Tre ritade kameraområden för rörelse, fordon och registreringsskylt. Pillow beskär analyskopior medan originalbilder behålls.
+- Valbart rörelsefilter efter Home Assistant-trigger.
+- Kamerastillbild för polygonredigeraren.
+
 ## 3.1.11
 - Bildinsamling stöder nu 1–8 snapshots per händelse.
 - Fördröjning före första snapshot kan vara upp till 30 sekunder.
