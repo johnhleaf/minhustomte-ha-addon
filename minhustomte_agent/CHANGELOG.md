@@ -1,3 +1,9 @@
+## 3.1.13
+- Kamera-AI använder nu ett kort HLS/livevideoklipp när minst tre bildrutor ska analyseras.
+- Väljer den skarpaste bildrutan i varje tidsdel av klippet för bättre registreringsavläsning.
+- Själva videon lämnar aldrig Home Assistant; endast upp till åtta valda JPEG-bilder skickas vidare.
+- Automatisk fallback till tidigare snapshotinsamling om HLS/video inte fungerar.
+
 ## 3.1.12
 - Tre ritade kameraområden för rörelse, fordon och registreringsskylt. Pillow beskär analyskopior medan originalbilder behålls.
 - Valbart rörelsefilter efter Home Assistant-trigger.

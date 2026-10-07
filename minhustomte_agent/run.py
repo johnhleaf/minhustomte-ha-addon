@@ -4,7 +4,7 @@ from pathlib import Path
 from io import BytesIO
 from urllib.parse import urlparse,urlencode,urlsplit,urlunsplit,quote
 import requests, websocket
-from PIL import Image,ImageDraw,ImageChops,ImageOps
+from PIL import Image,ImageDraw,ImageChops,ImageOps,ImageFilter,ImageStat
 from requests.auth import HTTPDigestAuth
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -44,7 +44,7 @@ class Agent:
     def pair(self):
         code=str(self.cfg.get('auth_code','')).strip()
         if not code: raise RuntimeError('Ingen auth_code angiven och hubben är inte parkopplad')
-        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.12','ha_version':inf.get('version')}
+        inf=self.supervisor_info(); payload={'auth_code':code,'hub_id':self.hub_id or ('MHA-'+uuid.uuid4().hex[:12].upper()),'hub_version':'3.1.13','ha_version':inf.get('version')}
         r=requests.post(self.server+'/functions/v1/raspberry-auth',json=payload,timeout=30)
         if not r.ok: raise RuntimeError(f'Parkoppling misslyckades: {r.status_code} {r.text[:300]}')
         d=r.json();self.token=d.get('hub_token') or d.get('token');self.cabin_id=d.get('cabin_id');self.hub_id=d.get('hub_id') or payload['hub_id'];
@@ -214,7 +214,7 @@ class Agent:
             es=self.slim_entities(); cams=[]
             for e in es:
                 if e['domain']=='camera':cams.append({'entity_id':e['entity_id'],'name':e.get('friendly_name') or e['entity_id'],'status':'offline' if str(e.get('state') or '').lower() in ('unavailable','unknown','') else 'online','supports_stream':True})
-            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.12','ha_version':self.supervisor_info().get('version')},timeout=30);
+            r=requests.post(self.server+'/api/device/sync',json={'cabin_id':self.cabin_id,'hub_token':self.token,'entities':es,'cameras':cams,'hub_id':self.hub_id,'hub_version':'3.1.13','ha_version':self.supervisor_info().get('version')},timeout=30);
             if not r.ok: raise RuntimeError(f'HTTP {r.status_code} från /api/device/sync: {r.text[:500]}')
             try:
                 d=r.json(); watch=d.get('camera_ai_watch') or []
@@ -268,7 +268,7 @@ class Agent:
         return {'system_default':target,'is_system_default':target==url_path}
     def dashboard_status(self,url_path):
         rows=self.dashboard_list(); item=next((x for x in rows if x.get('url_path')==url_path),None); st=self.dashboard_state()
-        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.12','is_system_default':self.dashboard_is_system_default(url_path)}
+        return {'exists':bool(item),'managed':bool(st.get('managed') and st.get('url_path')==url_path),'dashboard':item,'last_published_at':st.get('last_published_at'),'dashboard_version':st.get('dashboard_version'),'agent_version':'3.1.13','is_system_default':self.dashboard_is_system_default(url_path)}
     def dashboard_apply(self,req):
         url_path=str(req.get('url_path') or 'minhustomte-home'); cfg=req.get('config')
         if not isinstance(cfg,dict) or not isinstance(cfg.get('views'),list): raise RuntimeError('Ogiltig dashboard-konfiguration')
@@ -307,6 +307,66 @@ class Agent:
         im=Image.open(BytesIO(base64.b64decode(raw['base64'])))
         im=ImageOps.exif_transpose(im).convert('RGB')
         return im
+    def camera_ai_frame_quality(self,raw,focus_zone=None):
+        # Lightweight local quality ranking. We do not OCR here; we only prefer
+        # sharp, contrast-rich frames before sending them to the Fast AI service.
+        im=self.camera_ai_image(raw).convert('L')
+        if isinstance(focus_zone,list) and len(focus_zone)>=3:
+            try:
+                w,h=im.size
+                pts=[(max(0,min(w,int(float(p[0])*w))),max(0,min(h,int(float(p[1])*h)))) for p in focus_zone]
+                left=max(0,min(x for x,y in pts)); top=max(0,min(y for x,y in pts)); right=min(w,max(x for x,y in pts)); bottom=min(h,max(y for x,y in pts))
+                if right-left>=24 and bottom-top>=18: im=im.crop((left,top,right,bottom))
+            except Exception: pass
+        im.thumbnail((360,240),Image.Resampling.LANCZOS)
+        if im.width<8 or im.height<8:return 0.0
+        stat=ImageStat.Stat(im)
+        contrast=float(stat.stddev[0] if stat.stddev else 0.0)
+        edges=im.filter(ImageFilter.FIND_EDGES)
+        est=ImageStat.Stat(edges)
+        edge_mean=float(est.mean[0] if est.mean else 0.0)
+        edge_std=float(est.stddev[0] if est.stddev else 0.0)
+        brightness=float(stat.mean[0] if stat.mean else 0.0)
+        exposure=max(0.0,1.0-abs(brightness-128.0)/160.0)
+        return contrast*0.45+edge_mean*0.25+edge_std*0.30+exposure*8.0
+    def camera_ai_video_frames(self,entity_id,count,duration_s,focus_zone=None):
+        # Read a short HLS window and select one high-quality frame from each
+        # temporal bucket. This gives OCR independent observations across the
+        # vehicle passage instead of several near-identical snapshots.
+        url=self.camera_hls_url(entity_id)
+        token=os.environ.get('SUPERVISOR_TOKEN','')
+        duration=max(1.8,min(float(duration_s or 3.0),4.5))
+        sample_fps=max(4,min(8,int(round(max(count,3)*1.25))))
+        cmd=['ffmpeg','-hide_banner','-loglevel','error','-headers',f'Authorization: Bearer {token}\r\n','-i',url,'-t',f'{duration:.2f}','-an','-vf',f'fps={sample_fps}','-f','image2pipe','-vcodec','mjpeg','-q:v','3','pipe:1']
+        proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        try:
+            out,err=proc.communicate(timeout=duration+16)
+        except subprocess.TimeoutExpired:
+            proc.kill();out,err=proc.communicate();raise RuntimeError('Timeout när kort livevideoklipp hämtades från Home Assistant')
+        frames=[];pos=0
+        while len(frames)<40:
+            a=out.find(b'\xff\xd8',pos)
+            if a<0:break
+            b=out.find(b'\xff\xd9',a+2)
+            if b<0:break
+            frame=out[a:b+2];pos=b+2
+            if 1000<=len(frame)<=8*1024*1024:
+                frames.append({'content_type':'image/jpeg','base64':base64.b64encode(frame).decode(),'captured_at':datetime.now(timezone.utc).isoformat()})
+        if not frames:
+            detail=(err or b'').decode('utf-8','replace')[-500:].strip()
+            raise RuntimeError('Livevideo gav inga användbara bildrutor'+((' ('+detail+')') if detail else ''))
+        wanted=max(1,min(int(count),8,len(frames)))
+        selected=[]
+        # Temporal buckets prevent all selected frames from coming from the same
+        # instant while still choosing the sharpest observation in each bucket.
+        for bucket in range(wanted):
+            start=(bucket*len(frames))//wanted
+            end=((bucket+1)*len(frames))//wanted
+            chunk=frames[start:max(start+1,end)]
+            best=max(enumerate(chunk,start=start),key=lambda pair:self.camera_ai_frame_quality(pair[1],focus_zone))
+            selected.append((best[0],best[1]))
+        selected.sort(key=lambda x:x[0])
+        return [x[1] for x in selected],len(frames),duration
     def camera_ai_roi(self,im,zone,long_side):
         if not isinstance(zone,list) or len(zone)<3:return None
         w,h=im.size
@@ -333,11 +393,24 @@ class Agent:
         count=max(1,min(int(req.get('capture_count') or 3),8)); interval=max(150,min(int(req.get('capture_interval_ms') or 500),3000))/1000.0
         delay=max(0,min(int(req.get('capture_delay_ms') or 0),30000))/1000.0
         if delay: time.sleep(delay)
-        images=[]
-        for i in range(count):
-            images.append(self.camera_ai_snapshot(entity))
-            if i<count-1: time.sleep(interval)
+        images=[];capture_method='snapshots';source_frame_count=0;clip_duration_s=0.0
         vehicle_zone=req.get('vehicle_zone');plate_zone=req.get('plate_zone');motion_zone=req.get('motion_zone')
+        # For normal AI events, prefer a short livevideo window. The video itself
+        # is never uploaded or stored; only the selected JPEG frames leave HA.
+        if count>=3:
+            try:
+                clip_duration_s=max(2.0,min(4.5,1.0+interval*max(1,count-1)))
+                images,source_frame_count,clip_duration_s=self.camera_ai_video_frames(entity,count,clip_duration_s,plate_zone or vehicle_zone)
+                capture_method='hls_video'
+                log.info('AI-video %s: valde %s av %s frames ur %.1f s',entity,len(images),source_frame_count,clip_duration_s)
+            except Exception as e:
+                log.warning('AI-video %s misslyckades, faller tillbaka till snapshots: %s',entity,e)
+                images=[]
+        if not images:
+            for i in range(count):
+                images.append(self.camera_ai_snapshot(entity))
+                if i<count-1: time.sleep(interval)
+            source_frame_count=len(images);clip_duration_s=interval*max(0,len(images)-1);capture_method='snapshots'
         if req.get('motion_filter_enabled') and isinstance(motion_zone,list) and len(motion_zone)>=3:
             if count<2:
                 time.sleep(0.4);images.append(self.camera_ai_snapshot(entity))
@@ -350,7 +423,7 @@ class Agent:
                     if vehicle_zone:snapshot['ai_vehicle_base64']=self.camera_ai_roi(image,vehicle_zone,768)
                     if plate_zone:snapshot['ai_plate_base64']=self.camera_ai_roi(image,plate_zone,1024)
                 except Exception as e:log.warning('AI-beskärning misslyckades, original används: %s',e)
-        return {'entity_id':entity,'trigger_entity_id':req.get('trigger_entity_id'),'trigger_mode':req.get('trigger_mode') or 'manual','trigger_state':req.get('trigger_state'),'trigger_payload':req.get('trigger_payload') or {},'captured_at':datetime.now(timezone.utc).isoformat(),'images':images}
+        return {'entity_id':entity,'trigger_entity_id':req.get('trigger_entity_id'),'trigger_mode':req.get('trigger_mode') or 'manual','trigger_state':req.get('trigger_state'),'trigger_payload':req.get('trigger_payload') or {},'captured_at':datetime.now(timezone.utc).isoformat(),'capture_method':capture_method,'source_frame_count':source_frame_count,'clip_duration_s':round(float(clip_duration_s),2),'images':images}
     def camera_ai_send_capture(self,watch,event):
         entity=watch.get('entity_id'); trigger=watch.get('trigger_entity_id')
         key=f'{entity}|{trigger}'; now=time.monotonic()
@@ -361,7 +434,7 @@ class Agent:
             if data.get('filtered_motion'):
                 log.info('AI-rörelse filtrerades bort utanför markerat område: %s',entity);return
             data.update({'type':'camera_ai_capture','capture_id':uuid.uuid4().hex,'source':'ha_state_changed'})
-            self.send_json(data); log.info('AI-kamerahändelse %s <- %s: %s bilder',entity,trigger,len(data.get('images') or []))
+            self.send_json(data); log.info('AI-kamerahändelse %s <- %s: %s bilder via %s',entity,trigger,len(data.get('images') or []),data.get('capture_method') or 'okänd')
         except Exception as e: log.warning('AI-bildinsamling %s misslyckades: %s',entity,e)
     def camera_ai_event_matches(self,watch,entity_id,old_state,new_state):
         if not watch.get('enabled',True) or not watch.get('trigger_entity_id') or watch.get('trigger_entity_id')!=entity_id:return False
@@ -409,7 +482,7 @@ class Agent:
         if action=='get_state': return self.ha_get('/states/'+req['entity_id'])
         if action=='get_states': return self.entities()
         if action=='call_service': return self.ha_post('/services/'+req['domain']+'/'+req['service'],req.get('service_data') or {})
-        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.12','ha':self.supervisor_info(),'hostname':socket.gethostname()}
+        if action=='diagnostics': return {'hub_id':self.hub_id,'agent_version':'3.1.13','ha':self.supervisor_info(),'hostname':socket.gethostname()}
         if action=='camera_ai_config_refresh':
             self.sync_http(); return {'success':True,'watch_count':len(self.ai_watch)}
         if action=='camera_ai_preview': return self.camera_ai_snapshot(str(req.get('entity_id') or ''))
@@ -490,7 +563,7 @@ class Agent:
         except Exception as e: log.exception('message failed: %s',e)
     def heartbeat_loop(self):
         while self.running:
-            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.12','ha_version':self.supervisor_info().get('version')})
+            try:self.send_json({'type':'heartbeat','hub_id':self.hub_id,'agent_version':'3.1.13','ha_version':self.supervisor_info().get('version')})
             except:pass
             time.sleep(max(10,int(self.cfg.get('heartbeat_interval',30))))
     def sync_loop(self):
